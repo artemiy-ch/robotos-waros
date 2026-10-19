@@ -1,0 +1,654 @@
+import { AbstractMesh, Color3, PBRMaterial, Scene, ShadowGenerator, StandardMaterial, Vector3 } from "@babylonjs/core";
+import { HALF } from "./city";
+import type { Game } from "./game";
+import type { Mech, Models, RigName } from "./models";
+import type { ShotKind } from "./projectiles";
+import { approachAngle, clamp, raySphere, segSphere } from "./util";
+import { Gatling } from "./weapons";
+
+export type Kind = "drone" | "heavyDrone" | "walker" | "gunner" | "titan" | "bossTitan" | "bossTitan2" | "carrier" | "flagship";
+
+interface RigSpec {
+  model: RigName;
+  scale: number;
+  /** Walking animation; null for hovering robots. */
+  gait: "Walk" | "Run" | null;
+  /** Clip played before the wreck blows up; null blows up at once. */
+  death: string | null;
+  attack: string | null;
+  hit: string | null;
+  /** Bones the shots come out of, in turn. */
+  guns?: string[];
+  /** Or a rotary cannon on the chest bone: offset sideways/up/forward, and size. */
+  gatling?: { at: [number, number, number]; size: number };
+  tint?: Color3;
+}
+
+export interface Spec {
+  name: string;
+  hp: number;
+  speed: number;
+  radius: number;
+  score: number;
+  drop: number;
+  /** Distance it likes to keep from the player. */
+  want: number;
+  range: number;
+  dmg: number;
+  bulletSpeed: number;
+  burst: number;
+  cooldown: [number, number];
+  shot: ShotKind;
+  /**
+   * Hit spheres as [height above pos, radius, distance ahead]; the first one is
+   * also where it looks from and what explosions measure to.
+   */
+  hit: [number, number, number?][];
+  rig: RigSpec;
+  /** Gets a health bar at the top of the screen. */
+  boss?: boolean;
+  /** Flies at this fixed height, above the rooftops and their collisions. */
+  altitude?: number;
+  /** Walks straight through buildings, knocking them down. */
+  crusher?: boolean;
+  /** Seconds between ground stomps when the player is near; damage and reach. */
+  stomp?: { every: number; dmg: number; reach: number };
+  /** Salvos of homing rockets at the player, from the gun bones. */
+  rockets?: { every: number; count: number; dmg: number };
+  /** The final boss: fights in phases and goes down in a long crash. */
+  final?: boolean;
+  /** Launches this many drones every few seconds, up to a limit. */
+  launches?: { every: number; count: number; max: number };
+}
+
+export const SPECS: Record<Kind, Spec> = {
+  drone: {
+    name: "Дрон", hp: 4, speed: 10, radius: 1.1, score: 100, drop: 0.15, want: 16, range: 60,
+    dmg: 6, bulletSpeed: 34, burst: 1, cooldown: [1.2, 2.5], shot: "bolt", hit: [[0, 1.15]],
+    rig: { model: "EyeDrone", scale: 2.2, gait: null, death: null, attack: "Attack", hit: "Hit" },
+  },
+  heavyDrone: {
+    name: "Тяжёлый дрон", hp: 14, speed: 6, radius: 1.8, score: 300, drop: 0.6, want: 24, range: 65,
+    dmg: 8, bulletSpeed: 40, burst: 3, cooldown: [2.4, 3], shot: "bolt", hit: [[0, 1.85]],
+    rig: { model: "EyeDrone", scale: 3.6, gait: null, death: null, attack: "Charging", hit: "Hit", tint: new Color3(1, 0.45, 0.4) },
+  },
+  walker: {
+    name: "Паук", hp: 8, speed: 9, radius: 2.2, score: 150, drop: 0.2, want: 14, range: 50,
+    dmg: 6, bulletSpeed: 36, burst: 2, cooldown: [1.4, 2.4], shot: "bolt", hit: [[2.0, 2.0], [0.9, 1.4]],
+    rig: { model: "QuadShell", scale: 2.6, gait: "Run", death: "TurnOff", attack: "Attack", hit: "Hit", guns: ["Gun.L", "Gun.R"] },
+  },
+  gunner: {
+    name: "Стрелок", hp: 12, speed: 6, radius: 1.5, score: 250, drop: 0.35, want: 20, range: 60,
+    dmg: 5, bulletSpeed: 40, burst: 4, cooldown: [2, 3], shot: "bolt", hit: [[3.9, 1.6], [1.9, 1.1]],
+    rig: { model: "Stan", scale: 0.85, gait: "Walk", death: "Death", attack: null, hit: null, gatling: { at: [1.45, 0.75, 0.1], size: 0.9 } },
+  },
+  titan: {
+    name: "Трилобит", hp: 68, speed: 4.5, radius: 3.2, score: 700, drop: 0.8, want: 26, range: 80,
+    dmg: 16, bulletSpeed: 28, burst: 4, cooldown: [1.3, 1.9], shot: "plasma", hit: [[5.6, 3.2], [2.6, 2.4]],
+    rig: { model: "Trilobite", scale: 3.0, gait: "Walk", death: "TurnOff", attack: "AttackAuto", hit: "Hit", guns: ["Gun.L", "Gun.R"] },
+  },
+  bossTitan: {
+    name: "Гигантский трилобит", hp: 840, speed: 4.2, radius: 5.5, score: 3000, drop: 1, want: 24, range: 100,
+    dmg: 18, bulletSpeed: 28, burst: 7, cooldown: [2.2, 2.8], shot: "plasma", hit: [[10.3, 5.9], [4.8, 4.4]],
+    rig: { model: "Trilobite", scale: 5.5, gait: "Walk", death: "TurnOff", attack: "AttackAuto", hit: null, guns: ["Gun.L", "Gun.R"], tint: new Color3(0.8, 0.28, 0.22) },
+    boss: true, crusher: true, stomp: { every: 4.5, dmg: 28, reach: 16 }, rockets: { every: 5.5, count: 3, dmg: 22 },
+  },
+  // The Moon's boss: the giant again, bigger and half as tough again, with bigger rocket salvos.
+  bossTitan2: {
+    name: "Трилобит-разрушитель", hp: 1260, speed: 4.4, radius: 6.5, score: 6000, drop: 1, want: 26, range: 110,
+    dmg: 22, bulletSpeed: 30, burst: 9, cooldown: [1.9, 2.4], shot: "plasma", hit: [[12.1, 7], [5.7, 5.2]],
+    rig: { model: "Trilobite", scale: 6.5, gait: "Walk", death: "TurnOff", attack: "AttackAuto", hit: null, guns: ["Gun.L", "Gun.R"], tint: new Color3(0.55, 0.1, 0.08) },
+    boss: true, crusher: true, stomp: { every: 3.8, dmg: 34, reach: 20 }, rockets: { every: 4, count: 4, dmg: 30 },
+  },
+  carrier: {
+    name: "Крейсер-матка", hp: 480, speed: 9, radius: 12, score: 3500, drop: 1, want: 45, range: 140,
+    dmg: 7, bulletSpeed: 45, burst: 8, cooldown: [2.5, 3.5], shot: "bolt",
+    hit: [[0, 6, 0], [0, 6, 10], [0, 6, -10], [0, 5, 17], [0, 5, -16]],
+    rig: { model: "Carrier", scale: 2, gait: null, death: null, attack: null, hit: null },
+    boss: true, altitude: 72, launches: { every: 7, count: 2, max: 10 },
+  },
+  // The final boss: a battleship-sized carrier over the Moon station.
+  flagship: {
+    name: "Флагман «Левиафан»", hp: 2600, speed: 7, radius: 22, score: 20000, drop: 1, want: 55, range: 170,
+    dmg: 7, bulletSpeed: 48, burst: 12, cooldown: [1.8, 2.4], shot: "bolt",
+    hit: [[0, 11, 0], [0, 11, 14], [0, 11, -14], [0, 9, 27], [0, 9, -27]],
+    rig: { model: "Carrier", scale: 4, gait: null, death: null, attack: null, hit: null },
+    boss: true, final: true, altitude: 80,
+    launches: { every: 6, count: 3, max: 12 },
+    rockets: { every: 5, count: 5, dmg: 26 },
+  },
+};
+
+
+/** Which stage of the fight the final boss is in: 1 (above 60% health), 2, or 3 (below 25%). */
+export const stageOf = (e: Enemy) => (e.hp > e.spec.hp * 0.6 ? 1 : e.hp > e.spec.hp * 0.25 ? 2 : 3);
+
+/** Centre of one of an enemy's hit spheres. */
+function sphereAt(e: Enemy, [h, , ahead = 0]: [number, number, number?]) {
+  return new Vector3(e.pos.x + Math.sin(e.yaw) * ahead, e.pos.y + h, e.pos.z + Math.cos(e.yaw) * ahead);
+}
+
+export interface Enemy {
+  kind: Kind;
+  spec: Spec;
+  mech: Mech;
+  gatling: Gatling | null;
+  pos: Vector3;
+  vel: Vector3;
+  yaw: number;
+  hp: number;
+  hover: number;
+  phase: number;
+  strafe: number;
+  fireCd: number;
+  burst: number;
+  burstT: number;
+  flashT: number;
+  /** Next gun bone to fire from. */
+  gun: number;
+  /** Keeps the hit reaction from restarting on every bullet. */
+  hitAnimT: number;
+  /** The final boss's current stage of the fight (see stageOf). */
+  stage: number;
+  /** Timers for the bosses' crushing, stomping and drone launches. */
+  crushT: number;
+  stompT: number;
+  launchT: number;
+  /** Rockets left in the current salvo, and the timers between salvos and between rockets. */
+  salvo: number;
+  salvoT: number;
+  rocketT: number;
+}
+
+const DEATH_TIME = 1.1;
+/** Every wave brings this many times the base numbers. */
+const WAVE_SIZE = 1.25;
+
+export class Enemies {
+  readonly list: Enemy[] = [];
+  private dying: { e: Enemy; t: number }[] = [];
+  private tinted = new Map<string, PBRMaterial>();
+
+  constructor(private scene: Scene, private shadows: ShadowGenerator, private models: Models) {}
+
+  spawnWave(wave: number, g: Game) {
+    const add = (kind: Kind, count: number) => {
+      for (let i = 0; i < Math.ceil(count * WAVE_SIZE); i++) this.spawnAwayFrom(g, kind);
+    };
+    add("drone", Math.min(2 + wave, 10));
+    add("walker", Math.min(wave, 6));
+    if (wave >= 2) add("gunner", Math.min(wave - 1, 5));
+    if (wave >= 3) add("heavyDrone", Math.min(wave - 2, 4));
+    if (wave >= 2) add("titan", Math.min(Math.floor(wave / 2), 3));
+  }
+
+  private spawnAwayFrom(g: Game, kind: Kind) {
+    const p = g.player.pos;
+    for (let tries = 0; tries < 400; tries++) {
+      const x = (Math.random() * 2 - 1) * (HALF - 5);
+      const z = (Math.random() * 2 - 1) * (HALF - 5);
+      const d = Math.hypot(x - p.x, z - p.z);
+      if (d < 60 || d > 170 || !g.city.nav.isFree(x, z)) continue;
+      this.spawn(kind, x, z);
+      return;
+    }
+  }
+
+  /** A boss, somewhere out of sight. */
+  spawnBoss(kind: Kind, g: Game) {
+    this.spawnAwayFrom(g, kind);
+  }
+
+  private spawn(kind: Kind, x: number, z: number, y?: number) {
+    const spec = SPECS[kind];
+    const rig = spec.rig;
+    const mech = this.models.spawn(rig.model, rig.scale);
+    mech.anim.play("Idle", { instant: true });
+    if (rig.tint) for (const m of mech.meshes) m.material = this.tint(m, rig.tint);
+    // The flagship gets its own copy of the hull material, so it can glow red with rage.
+    if (spec.final) for (const m of mech.meshes) if (m.material) m.material = m.material.clone("flagshipHull");
+    const gatling = rig.gatling ? new Gatling(this.scene, this.shadows, "enemy", rig.gatling.size) : null;
+    const hover = spec.altitude ?? (rig.gait ? 0 : kind === "heavyDrone" ? 5 + Math.random() * 2 : 3.5 + Math.random() * 3);
+    const pos = new Vector3(x, y ?? hover, z);
+    mech.root.position.copyFrom(pos);
+    this.list.push({
+      kind, spec, mech, gatling, pos, hover,
+      vel: Vector3.Zero(),
+      yaw: Math.random() * Math.PI * 2,
+      hp: spec.hp,
+      phase: Math.random() * 10,
+      strafe: Math.random() < 0.5 ? -1 : 1,
+      fireCd: 1 + Math.random() * 2,
+      burst: 0,
+      burstT: 0,
+      flashT: 0,
+      gun: 0,
+      hitAnimT: 0,
+      crushT: 0,
+      stompT: spec.stomp?.every ?? 0,
+      launchT: 2,
+      stage: 1,
+      salvo: 0,
+      salvoT: 0,
+      rocketT: spec.rockets ? 3 : 0,
+    });
+  }
+
+  /** A tinted copy of a mesh's material, shared by every enemy with that tint. */
+  private tint(mesh: AbstractMesh, color: Color3) {
+    const src = mesh.material as PBRMaterial;
+    const key = `${src.name}/${color.toHexString()}`;
+    let m = this.tinted.get(key);
+    if (!m) {
+      m = src.clone(`${src.name}-tinted`) as PBRMaterial;
+      m.albedoColor = color;
+      this.tinted.set(key, m);
+    }
+    return m;
+  }
+
+  /** Where an enemy is aimed at: the middle of its main hit sphere. */
+  centre(e: Enemy) {
+    return sphereAt(e, e.spec.hit[0]);
+  }
+
+  private eye(e: Enemy) {
+    return sphereAt(e, e.spec.hit[0]);
+  }
+
+  update(dt: number, g: Game) {
+    const target = g.player.chest();
+    const canFire = g.state === "playing" && g.player.alive;
+    for (const e of this.list) {
+      const spec = e.spec;
+      const flying = !spec.rig.gait;
+      e.phase += dt;
+      e.hitAnimT -= dt;
+      const eye = this.eye(e);
+      const to = target.subtract(eye);
+      const dist = to.length();
+      const los = dist < Math.max(90, spec.range) && g.city.lineOfSight(eye, target);
+      const flat = Math.hypot(to.x, to.z) || 1;
+      const ux = to.x / flat, uz = to.z / flat;
+
+      // Seen the player: keep a comfortable range and circle around. Otherwise follow the flow field.
+      let mx = 0, mz = 0;
+      if (los) {
+        const radial = flat > spec.want + 5 ? 1 : flat < spec.want - 6 ? -1 : 0;
+        mx = ux * radial - uz * e.strafe * 0.7;
+        mz = uz * radial + ux * e.strafe * 0.7;
+        if (Math.random() < dt * 0.5) {
+          e.strafe = -e.strafe;
+          if (flying && Math.random() < 0.3) e.mech.anim.oneShot("BackFlip");
+        }
+      } else if (spec.altitude || spec.crusher) {
+        // Over the rooftops, or straight through the buildings: no need for the street grid.
+        mx = ux;
+        mz = uz;
+      } else {
+        const s = g.city.nav.steer(e.pos.x, e.pos.z);
+        if (s) {
+          mx = s.x;
+          mz = s.z;
+        }
+      }
+      const ml = Math.hypot(mx, mz);
+      if (ml > 1) {
+        mx /= ml;
+        mz /= ml;
+      }
+      const k = 1 - Math.exp(-3 * dt);
+      const speed = spec.final && e.stage >= 3 ? spec.speed * 1.6 : spec.speed;
+      e.vel.x += (mx * speed - e.vel.x) * k;
+      e.vel.z += (mz * speed - e.vel.z) * k;
+      for (const o of this.list) {
+        if (o === e) continue;
+        const sx = e.pos.x - o.pos.x, sz = e.pos.z - o.pos.z;
+        const min = spec.radius + o.spec.radius + 1.5;
+        const d2 = sx * sx + sz * sz;
+        if (d2 < min * min && d2 > 1e-6) {
+          const d = Math.sqrt(d2);
+          e.vel.x += (sx / d) * 12 * dt;
+          e.vel.z += (sz / d) * 12 * dt;
+        }
+      }
+      e.pos.x += e.vel.x * dt;
+      e.pos.z += e.vel.z * dt;
+      if (flying) {
+        // Drones climb after a player hovering above the streets or standing on a roof.
+        const alt = spec.altitude ? e.hover : Math.max(e.hover, Math.min(g.player.pos.y + e.hover * 0.6, 85));
+        e.pos.y += (alt + Math.sin(e.phase * 1.7) * 0.4 - e.pos.y) * Math.min(1, dt * 1.5);
+      }
+      if (spec.crusher) this.crush(e, dt, g);
+      else if (!spec.altitude) g.city.collide(e.pos, spec.radius);
+      if (spec.altitude) {
+        e.pos.x = clamp(e.pos.x, -HALF, HALF);
+        e.pos.z = clamp(e.pos.z, -HALF, HALF);
+      }
+
+      const hs = Math.hypot(e.vel.x, e.vel.z);
+      const wantYaw = los ? Math.atan2(ux, uz) : hs > 0.5 ? Math.atan2(e.vel.x, e.vel.z) : e.yaw;
+      e.yaw = approachAngle(e.yaw, wantYaw, dt * (flying ? 8 : 4));
+      e.mech.root.position.copyFrom(e.pos);
+      e.mech.root.rotation.y = e.yaw;
+
+      if (flying) {
+        const fwd = e.vel.x * Math.sin(e.yaw) + e.vel.z * Math.cos(e.yaw);
+        const side = e.vel.x * Math.cos(e.yaw) - e.vel.z * Math.sin(e.yaw);
+        e.mech.root.rotation.x = clamp(fwd * 0.03, -0.35, 0.35);
+        e.mech.root.rotation.z = clamp(-side * 0.03, -0.35, 0.35);
+        e.mech.anim.play("Idle");
+      } else if (hs < 0.7) e.mech.anim.play("Idle");
+      else {
+        const along = (e.vel.x * Math.sin(e.yaw) + e.vel.z * Math.cos(e.yaw)) / hs;
+        e.mech.anim.play(spec.rig.gait!, { speed: ((along < -0.3 ? -1 : 1) * hs) / spec.speed });
+      }
+      e.mech.anim.update(dt);
+      if (e.gatling) {
+        this.mountGatling(e);
+        e.gatling.aimAt(target, e.yaw, 0.9);
+        e.gatling.update(dt, e.burst > 0);
+      }
+      e.flashT -= dt;
+      e.mech.setFlash(e.flashT > 0);
+
+      if (!canFire) continue;
+      if (spec.stomp) this.stomp(e, dt, flat, g);
+      if (spec.launches) this.launch(e, dt, g);
+      if (spec.final) this.stages(e, g);
+      if (spec.rockets && (!spec.final || e.stage >= 2)) this.rocketSalvo(e, dt, los, dist, target, g);
+      e.fireCd -= dt;
+      if (los && dist < spec.range && e.fireCd <= 0) {
+        e.burst = spec.burst;
+        e.burstT = 0;
+        e.fireCd = spec.cooldown[0] + Math.random() * (spec.cooldown[1] - spec.cooldown[0]);
+        if (spec.rig.attack) e.mech.anim.oneShot(spec.rig.attack);
+      }
+      e.burstT -= dt;
+      if (e.burst > 0 && e.burstT <= 0) {
+        this.fire(e, target, g);
+        e.burst--;
+        e.burstT = 0.14;
+      }
+    }
+    this.updateDying(dt, g);
+  }
+
+  /** The giant smashes whatever buildings it walks into. */
+  private crush(e: Enemy, dt: number, g: Game) {
+    e.crushT -= dt;
+    if (e.crushT > 0) return;
+    e.crushT = 0.25;
+    const ahead = new Vector3(e.pos.x + Math.sin(e.yaw) * 2, 5, e.pos.z + Math.cos(e.yaw) * 2);
+    g.destruction.blast(ahead, e.spec.radius + 2, 45, g);
+    const lim = HALF - e.spec.radius;
+    e.pos.x = clamp(e.pos.x, -lim, lim);
+    e.pos.z = clamp(e.pos.z, -lim, lim);
+  }
+
+  /** Close up, the giant rears and slams the ground: a shockwave the player has to jump over. */
+  private stomp(e: Enemy, dt: number, flat: number, g: Game) {
+    const st = e.spec.stomp!;
+    e.stompT -= dt;
+    if (e.stompT > 0 || flat > st.reach * 1.4) return;
+    e.stompT = st.every;
+    e.mech.anim.oneShot("Attack");
+    const at = new Vector3(e.pos.x, 0.3, e.pos.z);
+    g.fx.slam(at, st.reach);
+    g.sfx.slam(Vector3.Distance(at, g.player.pos));
+    g.addShake(Vector3.Distance(at, g.player.pos), 0.9);
+    const p = g.player;
+    if (p.grounded && Math.hypot(p.pos.x - at.x, p.pos.z - at.z) < st.reach) g.hurtPlayer(st.dmg);
+  }
+
+  /** Every few seconds, a salvo of homing rockets that arc up out of its guns and come down on the player. */
+  private rocketSalvo(e: Enemy, dt: number, los: boolean, dist: number, target: Vector3, g: Game) {
+    const r = e.spec.rockets!;
+    e.rocketT -= dt;
+    if (e.rocketT <= 0 && los && dist < 130) {
+      e.rocketT = e.stage >= 3 ? r.every * 0.55 : r.every;
+      e.salvo = r.count;
+      // A beat of warning before the first one leaves: the guns spark and an alarm goes.
+      e.salvoT = 0.7;
+      e.mech.anim.oneShot("Attack");
+      for (const p of this.launchPoints(e)) g.fx.spark(p, 25);
+      g.sfx.missileWarning();
+      g.hud.warning("Ракетный залп!");
+    }
+    e.salvoT -= dt;
+    if (e.salvo <= 0 || e.salvoT > 0) return;
+    e.salvoT = 0.35;
+    e.salvo--;
+    const points = this.launchPoints(e);
+    const from = points[e.salvo % points.length].addInPlaceFromFloats(0, 2, 0);
+    const dir = target.subtract(from).normalize().addInPlaceFromFloats((Math.random() - 0.5) * 0.9, 0.9, (Math.random() - 0.5) * 0.9).normalize();
+    g.projectiles.enemyRocket(from, dir, r.dmg, g);
+    g.sfx.rocket(Math.max(0.15, 0.7 - Vector3.Distance(e.pos, g.player.pos) / 150));
+  }
+
+  /** Where rockets come out: the gun bones of walkers, or pods along a ship's hull. */
+  private launchPoints(e: Enemy) {
+    const guns = e.spec.rig.guns;
+    if (guns) return guns.map((gun) => e.mech.bonePosition(gun));
+    const r = e.spec.radius;
+    return [-0.7, -0.25, 0.25, 0.7].map((f) => sphereAt(e, [-r * 0.15, 0, f * r]));
+  }
+
+  /**
+   * The final boss gets angrier as it is hurt: it comes lower, starts firing missile salvos,
+   * then glows red, speeds up and fires them twice as often.
+   */
+  private stages(e: Enemy, g: Game) {
+    const stage = stageOf(e);
+    if (stage === 3) {
+      const pulse = 0.35 + 0.25 * Math.sin(e.phase * 6);
+      for (const m of e.mech.meshes) if (m.material instanceof StandardMaterial) m.material.emissiveColor = new Color3(pulse, 0.04, 0.02);
+    }
+    if (stage === e.stage) return;
+    e.stage = stage;
+    e.hover = stage === 2 ? 55 : 42;
+    e.launchT = 0;
+    g.sfx.bossAlarm();
+    g.hud.warning(stage === 2 ? "Флагман снижается!" : "Флагман в ярости!");
+    g.addShake(0, 0.6);
+  }
+
+  /** The carrier drops drones out of its belly. */
+  private launch(e: Enemy, dt: number, g: Game) {
+    const l = e.spec.launches!;
+    e.launchT -= dt;
+    if (e.launchT > 0) return;
+    e.launchT = l.every;
+    const drones = this.list.filter((o) => o.kind === "drone").length;
+    for (let i = 0; i < Math.min(l.count, l.max - drones); i++) {
+      const side = (i % 2 ? 1 : -1) * 5;
+      this.spawn("drone", e.pos.x + Math.cos(e.yaw) * side, e.pos.z - Math.sin(e.yaw) * side, e.pos.y - 5);
+      g.fx.spark(new Vector3(e.pos.x, e.pos.y - 4, e.pos.z), 20);
+    }
+  }
+
+  private mountGatling(e: Enemy) {
+    const [lx, ly, lz] = e.spec.rig.gatling!.at;
+    const chest = e.mech.bonePosition("Chest");
+    const s = Math.sin(e.yaw), c = Math.cos(e.yaw);
+    e.gatling!.node.position.set(chest.x + c * lx + s * lz, chest.y + ly, chest.z - s * lx + c * lz);
+  }
+
+  private fire(e: Enemy, target: Vector3, g: Game) {
+    const spread = 0.05;
+    const guns = e.spec.rig.guns;
+    let from: Vector3;
+    if (e.gatling) {
+      e.gatling.fire();
+      from = e.gatling.muzzlePosition();
+    } else if (guns) {
+      from = e.mech.bonePosition(guns[e.gun++ % guns.length]);
+      from.addInPlace(target.subtract(from).normalize().scale(0.6 * e.spec.rig.scale));
+      g.fx.spark(from, 6);
+    } else if (e.spec.altitude) {
+      // Belly turrets along the hull.
+      from = sphereAt(e, [-e.spec.radius * 0.18, 0, (Math.random() - 0.5) * e.spec.radius * 1.6]);
+    } else from = e.pos.add(target.subtract(e.pos).normalize().scale(e.spec.radius + 0.3));
+    const dir = target.subtract(from).normalize();
+    dir.addInPlaceFromFloats((Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread).normalize();
+    g.projectiles.spawn(from, dir.scale(e.spec.bulletSpeed), e.spec.shot, e.spec.dmg);
+    g.sfx.enemyShoot(Vector3.Distance(e.pos, g.player.pos), e.spec.shot === "plasma");
+  }
+
+  /** `quiet` skips the hit click (the laser hits every frame). */
+  damage(e: Enemy, dmg: number, g: Game, quiet = false) {
+    if (e.hp <= 0) return;
+    e.hp -= dmg;
+    e.flashT = 0.08;
+    g.hud.hitMarker();
+    if (!quiet) g.sfx.hit();
+    if (e.hp > 0) {
+      if (e.spec.rig.hit && e.hitAnimT <= 0) {
+        e.mech.anim.oneShot(e.spec.rig.hit);
+        e.hitAnimT = 0.8;
+      }
+      return;
+    }
+    this.list.splice(this.list.indexOf(e), 1);
+    g.onEnemyKilled(e);
+    e.mech.setFlash(false);
+    if (e.spec.rig.death || e.spec.final) {
+      if (e.spec.rig.death) e.mech.anim.play(e.spec.rig.death, { loop: false, speed: 1.3 });
+      this.dying.push({ e, t: 0 });
+    } else this.disposeEnemy(e);
+  }
+
+  /** Walkers play their shut-down animation, then blow up. */
+  private updateDying(dt: number, g: Game) {
+    for (let i = this.dying.length - 1; i >= 0; i--) {
+      const d = this.dying[i];
+      d.t += dt;
+      if (d.e.spec.final) {
+        if (this.crash(d.e, d.t, dt, g)) this.dying.splice(i, 1);
+        continue;
+      }
+      d.e.mech.anim.update(dt);
+      if (d.e.gatling) {
+        this.mountGatling(d.e);
+        d.e.gatling.update(dt, false);
+      }
+      if (d.t < DEATH_TIME) continue;
+      const size = d.e.spec.boss ? 3.5 : d.e.kind === "titan" ? 2.2 : 1.4;
+      const dist = Vector3.Distance(d.e.pos, g.player.pos);
+      g.fx.explosion(d.e.pos.add(new Vector3(0, d.e.spec.hit[0][0] * 0.6, 0)), size);
+      g.sfx.explode(true, dist);
+      g.addShake(dist, size > 2 ? 0.9 : 0.5);
+      this.disposeEnemy(d.e);
+      this.dying.splice(i, 1);
+    }
+  }
+
+  /**
+   * The flagship's end: it lurches, noses over and falls burning for a few seconds, blowing up
+   * along its hull, then hits the station in one enormous blast that flattens the blocks around.
+   * Returns true when it is over.
+   */
+  private crash(e: Enemy, t: number, dt: number, g: Game) {
+    const FALL = 4.5;
+    if (t < FALL) {
+      e.vel.y = (e.vel.y || 0) - 14 * dt;
+      e.pos.addInPlace(e.vel.scale(dt));
+      e.pos.x += Math.sin(e.yaw) * 10 * dt;
+      e.pos.z += Math.cos(e.yaw) * 10 * dt;
+      e.mech.root.position.copyFrom(e.pos);
+      e.mech.root.rotation.x = Math.min(0.6, e.mech.root.rotation.x + dt * 0.18);
+      e.mech.root.rotation.z += dt * 0.12;
+      e.flashT -= dt;
+      if (e.flashT <= 0) {
+        e.flashT = 0.22;
+        const along = (Math.random() - 0.5) * e.spec.radius * 1.6;
+        g.fx.explosion(sphereAt(e, [(Math.random() - 0.5) * 6, 0, along]), 1.4, true);
+        g.sfx.explode(false, Vector3.Distance(e.pos, g.player.pos) * 0.5);
+        g.addShake(0, 0.25);
+      }
+      if (e.pos.y > 4) return false;
+    }
+    // Impact.
+    const at = new Vector3(e.pos.x, 2, e.pos.z);
+    for (let k = 0; k < 6; k++) {
+      const off = new Vector3((Math.random() - 0.5) * 50, Math.random() * 10, (Math.random() - 0.5) * 50);
+      setTimeout(() => g.fx.explosion(at.add(off), 3, k > 1), k * 180);
+    }
+    g.fx.slam(at, 60);
+    g.sfx.explode(true, 0);
+    g.sfx.slam(0);
+    g.addShake(0, 1);
+    g.destruction.blast(at.add(new Vector3(0, 6, 0)), 40, 1000, g);
+    this.disposeEnemy(e);
+    g.onFinalBossDown();
+    return true;
+  }
+
+  private disposeEnemy(e: Enemy) {
+    e.mech.dispose();
+    e.gatling?.dispose();
+  }
+
+  /** The first enemy whose body the segment a→b passes through. */
+  hitTest(a: Vector3, b: Vector3) {
+    for (const e of this.list) {
+      for (const sp of e.spec.hit) if (segSphere(a, b, sphereAt(e, sp), sp[1])) return e;
+    }
+    return null;
+  }
+
+  /** The nearest enemy along a unit ray within maxT, and how far it is. */
+  raycastEnemy(o: Vector3, d: Vector3, maxT: number) {
+    let best: { t: number; enemy: Enemy } | null = null;
+    for (const e of this.list) {
+      for (const sp of e.spec.hit) {
+        const t = raySphere(o, d, sphereAt(e, sp), sp[1]);
+        if (t < (best?.t ?? maxT)) best = { t, enemy: e };
+      }
+    }
+    return best;
+  }
+
+  /** Distance along a unit ray to the nearest enemy, or maxT. */
+  raycast(o: Vector3, d: Vector3, maxT: number) {
+    let best = maxT;
+    for (const e of this.list) {
+      for (const sp of e.spec.hit) best = Math.min(best, raySphere(o, d, sphereAt(e, sp), sp[1]));
+    }
+    return best;
+  }
+
+  /** Explosion damage, measured to the nearest hit sphere; returns who was caught in it. */
+  splash(center: Vector3, radius: number, dmg: number, g: Game) {
+    const caught: Enemy[] = [];
+    for (const e of [...this.list]) {
+      const d = Math.min(...e.spec.hit.map((sp) => Vector3.Distance(center, sphereAt(e, sp)) - sp[1]));
+      if (d >= radius) continue;
+      caught.push(e);
+      this.damage(e, Math.max(1, dmg * (1 - Math.max(0, d) / radius)), g);
+    }
+    return caught;
+  }
+
+  /** A shove away from `from` (the landing shockwave). */
+  knockBack(e: Enemy, from: Vector3, strength: number) {
+    const dx = e.pos.x - from.x, dz = e.pos.z - from.z;
+    const d = Math.hypot(dx, dz) || 1;
+    const k = e.spec.boss ? 0.15 : 1;
+    e.vel.x += (dx / d) * strength * k;
+    e.vel.z += (dz / d) * strength * k;
+    e.flashT = 0.15;
+  }
+
+  get boss() {
+    return this.list.find((e) => e.spec.boss) ?? null;
+  }
+
+  clear() {
+    for (const e of this.list) this.disposeEnemy(e);
+    for (const d of this.dying) this.disposeEnemy(d.e);
+    this.list.length = 0;
+    this.dying.length = 0;
+  }
+}
+

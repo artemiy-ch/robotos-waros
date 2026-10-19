@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Robot Wars</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+
+    <div id="hud">
+      <div id="crosshair"></div>
+      <div id="hitmarker"></div>
+      <div id="damage"></div>
+      <div id="flash"></div>
+      <div id="fade"></div>
+      <div id="banner"></div>
+      <div id="warning"></div>
+      <div id="boss" class="hidden">
+        <div id="boss-name"></div>
+        <div id="boss-bar"><div id="boss-fill"></div></div>
+      </div>
+      <div id="upgrades" class="hidden">
+        <div class="upgrades-title">Выбери улучшение — нажми 1, 2 или 3</div>
+        <div id="upgrade-cards"></div>
+      </div>
+      <div class="panel" id="health">
+        <div class="row">
+          <span class="label">HP</span>
+          <div class="bar"><div id="hp-fill"></div></div>
+          <b id="hp-text">100</b>
+        </div>
+        <div class="row">
+          <span class="label">Топливо</span>
+          <div class="bar"><div id="fuel-fill"></div></div>
+          <kbd>Пробел</kbd>
+        </div>
+        <div class="row hidden" id="laser-row">
+          <span class="label" id="laser-label">Лазер</span>
+          <div class="bar"><div id="laser-fill"></div></div>
+          <b id="laser-text"></b>
+        </div>
+        <div class="row">
+          <span class="label">Ракеты</span>
+          <div class="bar"><div id="rocket-fill"></div></div>
+          <kbd>E</kbd>
+        </div>
+      </div>
+      <div class="panel" id="stats">
+        <div><span class="label">Счёт</span><b id="score">0</b></div>
+        <div><span class="label">Волна</span><b id="wave">0</b></div>
+        <div><span class="label">Врагов</span><b id="left">0</b></div>
+      </div>
+      <canvas id="minimap" width="180" height="180"></canvas>
+    </div>
+
+    <div id="overlay">
+      <div class="card">
+        <h1 id="ov-title">ROBOT WARS</h1>
+        <p id="ov-text"></p>
+        <ul class="controls">
+          <li><kbd>W A S D</kbd> движение</li>
+          <li><kbd>Shift</kbd> бег</li>
+          <li><kbd>Пробел</kbd> полёт</li>
+          <li><kbd>Q</kbd> в воздухе — удар о землю</li>
+          <li><kbd>Мышь</kbd> прицел</li>
+          <li><kbd>ЛКМ</kbd> пулемёты</li>
+          <li><kbd>E</kbd> залп ракет</li>
+          <li><kbd>Колесо</kbd> зум</li>
+          <li><kbd>Esc</kbd> пауза</li>
+        </ul>
+        <p class="credits">
+          Модели: герой — <a href="https://poly.pizza/m/BwjA6Thdzd" target="_blank" rel="noopener" onclick="event.stopPropagation()">«Rigged robot» by joney_lol</a>
+          (<a href="https://creativecommons.org/licenses/by/3.0/" target="_blank" rel="noopener" onclick="event.stopPropagation()">CC BY 3.0</a>) ·
+          роботы и пропсы — <a href="https://quaternius.com" target="_blank" rel="noopener" onclick="event.stopPropagation()">Quaternius</a>, <a href="https://quaternius.com" target="_blank" rel="noopener" onclick="event.stopPropagation()">Sci-Fi Essentials Kit</a> и
+          <a href="https://opengameart.org/node/126992" target="_blank" rel="noopener" onclick="event.stopPropagation()">Animated Mech Pack</a> (CC0) ·
+          корабль — <a href="https://opengameart.org/content/lowpoly-spaceships-pack" target="_blank" rel="noopener" onclick="event.stopPropagation()">Quaternius, Ultimate Spaceships</a> (CC0) ·
+          звуки — <a href="https://elevenlabs.io" target="_blank" rel="noopener" onclick="event.stopPropagation()">ElevenLabs</a>
+        </p>
+        <p class="credits legal">
+          © 2026 Robot Wars. Некоммерческий проект. Копирование и распространение игры без разрешения автора запрещено.
+          Сторонние модели принадлежат их авторам и используются по указанным лицензиям.
+        </p>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
