@@ -6,6 +6,8 @@
 export class Input {
   /** Left button held. */
   fire = false;
+  /** Right button held (the shawarma launcher). */
+  alt = false;
   locked = false;
 
   private keys = new Set<string>();
@@ -17,19 +19,24 @@ export class Input {
   constructor(private canvas: HTMLCanvasElement, onLockChange: (locked: boolean) => void) {
     // e.code is the physical key, so WASD works with any keyboard layout.
     window.addEventListener("keydown", (e) => {
+      if (e.target instanceof HTMLInputElement) return; // typing the nickname
+      // macOS never sends the key-up for keys let go while Cmd is down, so they would stick.
+      if (e.metaKey) return this.releaseAll();
       this.keys.add(e.code);
       if (!e.repeat) this.presses.add(e.code);
       if (e.code === "Space") e.preventDefault();
     });
-    window.addEventListener("keyup", (e) => this.keys.delete(e.code));
-    window.addEventListener("blur", () => {
-      this.keys.clear();
-      this.fire = false;
+    window.addEventListener("keyup", (e) => {
+      this.keys.delete(e.code);
+      if (e.key === "Meta" || e.key === "Control" || e.key === "Alt") this.releaseAll();
     });
+    // Any time the page may have missed a key-up, forget everything held.
+    window.addEventListener("blur", () => this.releaseAll());
+    document.addEventListener("visibilitychange", () => this.releaseAll());
 
     document.addEventListener("pointerlockchange", () => {
       this.locked = document.pointerLockElement === canvas;
-      if (!this.locked) this.fire = false;
+      if (!this.locked) this.releaseAll();
       onLockChange(this.locked);
     });
     document.addEventListener("pointermove", (e) => {
@@ -39,9 +46,11 @@ export class Input {
     });
     canvas.addEventListener("pointerdown", (e) => {
       if (e.button === 0 && this.locked) this.fire = true;
+      if (e.button === 2 && this.locked) this.alt = true;
     });
     window.addEventListener("pointerup", (e) => {
       if (e.button === 0) this.fire = false;
+      if (e.button === 2) this.alt = false;
     });
     canvas.addEventListener("wheel", (e) => {
       this.wheel += e.deltaY;
@@ -57,6 +66,12 @@ export class Input {
     } catch {
       // Browsers refuse re-locking right after Esc; the player just clicks again.
     }
+  }
+
+  /** Lets go of every key and the trigger. */
+  releaseAll() {
+    this.keys.clear();
+    this.fire = this.alt = false;
   }
 
   down(...codes: string[]) {

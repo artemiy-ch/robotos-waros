@@ -1,12 +1,12 @@
 import { AbstractMesh, Color3, PBRMaterial, Scene, ShadowGenerator, StandardMaterial, Vector3 } from "@babylonjs/core";
-import { HALF } from "./city";
+import { HALF, NAV_FIELDS } from "./city";
 import type { Game } from "./game";
 import type { Mech, Models, RigName } from "./models";
 import type { ShotKind } from "./projectiles";
 import { approachAngle, clamp, raySphere, segSphere } from "./util";
 import { Gatling } from "./weapons";
 
-export type Kind = "drone" | "heavyDrone" | "walker" | "gunner" | "titan" | "bossTitan" | "bossTitan2" | "carrier" | "flagship";
+export type Kind = "drone" | "kamikaze" | "heavyDrone" | "walker" | "gunner" | "titan" | "bossTitan" | "bossTitan2" | "carrier" | "flagship";
 
 interface RigSpec {
   model: RigName;
@@ -55,6 +55,8 @@ export interface Spec {
   stomp?: { every: number; dmg: number; reach: number };
   /** Salvos of homing rockets at the player, from the gun bones. */
   rockets?: { every: number; count: number; dmg: number };
+  /** Flies straight at the player and blows itself up: how close it arms, the fuse, the blast. */
+  kamikaze?: { trigger: number; fuse: number; radius: number; dmg: number };
   /** The final boss: fights in phases and goes down in a long crash. */
   final?: boolean;
   /** Launches this many drones every few seconds, up to a limit. */
@@ -66,6 +68,12 @@ export const SPECS: Record<Kind, Spec> = {
     name: "Дрон", hp: 4, speed: 10, radius: 1.1, score: 100, drop: 0.15, want: 16, range: 60,
     dmg: 6, bulletSpeed: 34, burst: 1, cooldown: [1.2, 2.5], shot: "bolt", hit: [[0, 1.15]],
     rig: { model: "EyeDrone", scale: 2.2, gait: null, death: null, attack: "Attack", hit: "Hit" },
+  },
+  kamikaze: {
+    name: "Камикадзе", hp: 3, speed: 21, radius: 1.1, score: 120, drop: 0.05, want: 0, range: 0,
+    dmg: 0, bulletSpeed: 0, burst: 0, cooldown: [99, 99], shot: "bolt", hit: [[0, 1.2]],
+    rig: { model: "EyeDrone", scale: 2, gait: null, death: null, attack: "Charging", hit: "Hit", tint: new Color3(1, 0.62, 0.1) },
+    kamikaze: { trigger: 5, fuse: 0.55, radius: 7, dmg: 24 },
   },
   heavyDrone: {
     name: "Тяжёлый дрон", hp: 14, speed: 6, radius: 1.8, score: 300, drop: 0.6, want: 24, range: 65,
@@ -148,6 +156,15 @@ export interface Enemy {
   gun: number;
   /** Keeps the hit reaction from restarting on every bullet. */
   hitAnimT: number;
+  /** Seconds left of standing dazed after being hit by a shawarma. */
+  stunT: number;
+  /** Which distance field it follows when it can't see the player: 0 heads straight for them, the rest flank. */
+  flank: number;
+  /** Health and damage multipliers from the wave and the map. */
+  dmgScale: number;
+  /** Kamikaze: seconds left on the armed fuse (-1 while not armed), and time to the next beep. */
+  fuse: number;
+  beepT: number;
   /** The final boss's current stage of the fight (see stageOf). */
   stage: number;
   /** Timers for the bosses' crushing, stomping and drone launches. */
@@ -161,21 +178,37 @@ export interface Enemy {
 }
 
 const DEATH_TIME = 1.1;
-/** Every wave brings this many times the base numbers. */
-const WAVE_SIZE = 1.25;
+/** Every wave brings this many times the base numbers, up to a cap (each robot is a skinned model). */
+const WAVE_SIZE = 1.6;
+const WAVE_CAP = 46;
+/** Ordinary enemies move this much faster than their base speed, to keep up with the hero. */
+const PACE = 1.4;
+/** Enemies further than this from the player go round by their flanking routes. */
+const FLANK_FROM = 45;
 
 export class Enemies {
   readonly list: Enemy[] = [];
   private dying: { e: Enemy; t: number }[] = [];
   private tinted = new Map<string, PBRMaterial>();
 
+  /** Ordinary enemies get tougher every wave, and tougher still on the Moon. */
+  private hpScale = 1;
+  private dmgScale = 1;
+
   constructor(private scene: Scene, private shadows: ShadowGenerator, private models: Models) {}
 
   spawnWave(wave: number, g: Game) {
+    const moon = g.city.theme === "moon";
+    this.hpScale = 1.5 * (moon ? 1.35 : 1) * (1 + 0.05 * (wave - 1));
+    this.dmgScale = (moon ? 1.25 : 1) * (1 + 0.03 * (wave - 1));
+    let budget = WAVE_CAP;
     const add = (kind: Kind, count: number) => {
-      for (let i = 0; i < Math.ceil(count * WAVE_SIZE); i++) this.spawnAwayFrom(g, kind);
+      const n = Math.min(budget, Math.ceil(count * WAVE_SIZE));
+      budget -= n;
+      for (let i = 0; i < n; i++) this.spawnAwayFrom(g, kind);
     };
     add("drone", Math.min(2 + wave, 10));
+    if (wave >= 2) add("kamikaze", Math.min(wave, 8));
     add("walker", Math.min(wave, 6));
     if (wave >= 2) add("gunner", Math.min(wave - 1, 5));
     if (wave >= 3) add("heavyDrone", Math.min(wave - 2, 4));
@@ -211,11 +244,16 @@ export class Enemies {
     const hover = spec.altitude ?? (rig.gait ? 0 : kind === "heavyDrone" ? 5 + Math.random() * 2 : 3.5 + Math.random() * 3);
     const pos = new Vector3(x, y ?? hover, z);
     mech.root.position.copyFrom(pos);
+    const scaled = !spec.boss;
     this.list.push({
       kind, spec, mech, gatling, pos, hover,
       vel: Vector3.Zero(),
       yaw: Math.random() * Math.PI * 2,
-      hp: spec.hp,
+      hp: scaled ? spec.hp * this.hpScale : spec.hp,
+      dmgScale: scaled ? this.dmgScale : 1,
+      flank: Math.random() < 0.35 ? 0 : 1 + Math.floor(Math.random() * (NAV_FIELDS - 1)),
+      fuse: -1,
+      beepT: 0,
       phase: Math.random() * 10,
       strafe: Math.random() < 0.5 ? -1 : 1,
       fireCd: 1 + Math.random() * 2,
@@ -224,6 +262,7 @@ export class Enemies {
       flashT: 0,
       gun: 0,
       hitAnimT: 0,
+      stunT: 0,
       crushT: 0,
       stompT: spec.stomp?.every ?? 0,
       launchT: 2,
@@ -264,6 +303,10 @@ export class Enemies {
       const flying = !spec.rig.gait;
       e.phase += dt;
       e.hitAnimT -= dt;
+      if (e.stunT > 0) {
+        this.daze(e, dt);
+        continue;
+      }
       const eye = this.eye(e);
       const to = target.subtract(eye);
       const dist = to.length();
@@ -273,7 +316,11 @@ export class Enemies {
 
       // Seen the player: keep a comfortable range and circle around. Otherwise follow the flow field.
       let mx = 0, mz = 0;
-      if (los) {
+      if (spec.kamikaze) {
+        const s = los || flat < 30 ? null : g.city.nav.steer(e.pos.x, e.pos.z);
+        mx = s ? s.x : ux;
+        mz = s ? s.z : uz;
+      } else if (los) {
         const radial = flat > spec.want + 5 ? 1 : flat < spec.want - 6 ? -1 : 0;
         mx = ux * radial - uz * e.strafe * 0.7;
         mz = uz * radial + ux * e.strafe * 0.7;
@@ -286,7 +333,7 @@ export class Enemies {
         mx = ux;
         mz = uz;
       } else {
-        const s = g.city.nav.steer(e.pos.x, e.pos.z);
+        const s = g.city.nav.steer(e.pos.x, e.pos.z, flat > FLANK_FROM ? e.flank : 0) ?? g.city.nav.steer(e.pos.x, e.pos.z);
         if (s) {
           mx = s.x;
           mz = s.z;
@@ -298,26 +345,30 @@ export class Enemies {
         mz /= ml;
       }
       const k = 1 - Math.exp(-3 * dt);
-      const speed = spec.final && e.stage >= 3 ? spec.speed * 1.6 : spec.speed;
+      const speed = spec.final && e.stage >= 3 ? spec.speed * 1.6 : spec.boss ? spec.speed : spec.speed * PACE;
       e.vel.x += (mx * speed - e.vel.x) * k;
       e.vel.z += (mz * speed - e.vel.z) * k;
       for (const o of this.list) {
         if (o === e) continue;
         const sx = e.pos.x - o.pos.x, sz = e.pos.z - o.pos.z;
-        const min = spec.radius + o.spec.radius + 1.5;
+        const min = spec.radius + o.spec.radius + 3;
         const d2 = sx * sx + sz * sz;
         if (d2 < min * min && d2 > 1e-6) {
           const d = Math.sqrt(d2);
-          e.vel.x += (sx / d) * 12 * dt;
-          e.vel.z += (sz / d) * 12 * dt;
+          e.vel.x += (sx / d) * 22 * dt;
+          e.vel.z += (sz / d) * 22 * dt;
         }
       }
       e.pos.x += e.vel.x * dt;
       e.pos.z += e.vel.z * dt;
       if (flying) {
         // Drones climb after a player hovering above the streets or standing on a roof.
-        const alt = spec.altitude ? e.hover : Math.max(e.hover, Math.min(g.player.pos.y + e.hover * 0.6, 85));
-        e.pos.y += (alt + Math.sin(e.phase * 1.7) * 0.4 - e.pos.y) * Math.min(1, dt * 1.5);
+        const alt = spec.kamikaze
+          ? Math.max(2, target.y - 0.5)
+          : spec.altitude
+            ? e.hover
+            : Math.max(e.hover, Math.min(g.player.pos.y + e.hover * 0.6, 85));
+        e.pos.y += (alt + Math.sin(e.phase * 1.7) * 0.4 - e.pos.y) * Math.min(1, dt * (spec.kamikaze ? 4 : 1.5));
       }
       if (spec.crusher) this.crush(e, dt, g);
       else if (!spec.altitude) g.city.collide(e.pos, spec.radius);
@@ -352,6 +403,10 @@ export class Enemies {
       e.flashT -= dt;
       e.mech.setFlash(e.flashT > 0);
 
+      if (spec.kamikaze) {
+        if (canFire) this.tickFuse(e, dt, dist, g);
+        continue;
+      }
       if (!canFire) continue;
       if (spec.stomp) this.stomp(e, dt, flat, g);
       if (spec.launches) this.launch(e, dt, g);
@@ -371,7 +426,47 @@ export class Enemies {
         e.burstT = 0.14;
       }
     }
+    for (const e of this.list.filter((x) => x.fuse === 0)) this.detonate(e, g);
     this.updateDying(dt, g);
+  }
+
+  /** A kamikaze beeps faster as it closes in, arms within reach, and goes off when the fuse runs out. */
+  private tickFuse(e: Enemy, dt: number, dist: number, g: Game) {
+    const k = e.spec.kamikaze!;
+    if (e.fuse < 0 && dist < k.trigger + e.spec.radius) {
+      e.fuse = k.fuse;
+      e.mech.anim.oneShot("Charging");
+    }
+    if (e.fuse > 0) e.fuse = Math.max(0, e.fuse - dt);
+    e.beepT -= dt;
+    if (e.beepT <= 0 && dist < 45) {
+      e.beepT = e.fuse > 0 ? 0.09 : clamp(dist / 80, 0.12, 0.55);
+      e.flashT = 0.05;
+      g.sfx.beep(e.fuse > 0 ? 1 : 1 - dist / 45, dist);
+    }
+  }
+
+  /** Blows a kamikaze up where it is: hurts the player and anything else caught in the blast. */
+  private detonate(e: Enemy, g: Game) {
+    const i = this.list.indexOf(e);
+    if (i < 0) return;
+    this.list.splice(i, 1);
+    this.disposeEnemy(e);
+    this.blast(e, g);
+  }
+
+  private blast(e: Enemy, g: Game) {
+    const k = e.spec.kamikaze!;
+    const at = e.pos.clone();
+    const dist = Vector3.Distance(at, g.player.pos);
+    g.fx.explosion(at, 1.3);
+    g.sfx.explode(false, dist);
+    g.addShake(dist, 0.6);
+    const d = Vector3.Distance(at, g.player.chest());
+    if (d < k.radius) g.hurtPlayer(k.dmg * e.dmgScale * (1 - (d / k.radius) * 0.5));
+    // Other robots caught in it get hurt too.
+    this.splash(at, k.radius, 10, g);
+    g.props.blast(at, k.radius * 0.6, g);
   }
 
   /** The giant smashes whatever buildings it walks into. */
@@ -474,8 +569,11 @@ export class Enemies {
     e.gatling!.node.position.set(chest.x + c * lx + s * lz, chest.y + ly, chest.z - s * lx + c * lz);
   }
 
-  private fire(e: Enemy, target: Vector3, g: Game) {
-    const spread = 0.05;
+  private fire(e: Enemy, chest: Vector3, g: Game) {
+    const spread = 0.04;
+    // Aim where the player is going to be (about two thirds of the way).
+    const lead = Vector3.Distance(e.pos, chest) / Math.max(1, e.spec.bulletSpeed);
+    const target = chest.add(g.player.velocity.scale(lead * 0.65));
     const guns = e.spec.rig.guns;
     let from: Vector3;
     if (e.gatling) {
@@ -491,7 +589,7 @@ export class Enemies {
     } else from = e.pos.add(target.subtract(e.pos).normalize().scale(e.spec.radius + 0.3));
     const dir = target.subtract(from).normalize();
     dir.addInPlaceFromFloats((Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread).normalize();
-    g.projectiles.spawn(from, dir.scale(e.spec.bulletSpeed), e.spec.shot, e.spec.dmg);
+    g.projectiles.spawn(from, dir.scale(e.spec.bulletSpeed), e.spec.shot, e.spec.dmg * e.dmgScale);
     g.sfx.enemyShoot(Vector3.Distance(e.pos, g.player.pos), e.spec.shot === "plasma");
   }
 
@@ -512,6 +610,11 @@ export class Enemies {
     this.list.splice(this.list.indexOf(e), 1);
     g.onEnemyKilled(e);
     e.mech.setFlash(false);
+    if (e.spec.kamikaze) {
+      this.disposeEnemy(e);
+      this.blast(e, g);
+      return;
+    }
     if (e.spec.rig.death || e.spec.final) {
       if (e.spec.rig.death) e.mech.anim.play(e.spec.rig.death, { loop: false, speed: 1.3 });
       this.dying.push({ e, t: 0 });
@@ -628,6 +731,31 @@ export class Enemies {
       this.damage(e, Math.max(1, dmg * (1 - Math.max(0, d) / radius)), g);
     }
     return caught;
+  }
+
+  /** Hit by a shawarma: everything but a boss stops to spin round in a daze. */
+  feed(e: Enemy, seconds: number) {
+    e.flashT = 0.15;
+    if (e.spec.boss || seconds <= 0) return;
+    if (e.stunT <= 0 && e.spec.kamikaze) e.fuse = -1; // forgets it was about to blow up, too
+    e.stunT = seconds;
+  }
+
+  /** Dazed: no moving, no shooting, just turning on the spot and bobbing. */
+  private daze(e: Enemy, dt: number) {
+    e.stunT -= dt;
+    e.vel.scaleInPlace(Math.max(0, 1 - dt * 6));
+    e.pos.x += e.vel.x * dt;
+    e.pos.z += e.vel.z * dt;
+    e.yaw += dt * 9;
+    e.mech.root.position.copyFrom(e.pos);
+    e.mech.root.position.y += Math.abs(Math.sin(e.phase * 7)) * 0.4;
+    e.mech.root.rotation.y = e.yaw;
+    e.mech.root.rotation.z = Math.sin(e.phase * 5) * 0.15;
+    e.mech.anim.play("Idle");
+    e.mech.anim.update(dt);
+    e.flashT -= dt;
+    e.mech.setFlash(e.flashT > 0);
   }
 
   /** A shove away from `from` (the landing shockwave). */

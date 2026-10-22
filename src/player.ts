@@ -9,26 +9,27 @@ import { baseStats, type Stats, type Upgrade } from "./upgrades";
 import { approachAngle, clamp } from "./util";
 import { Gatling } from "./weapons";
 
-const WALK_SPEED = 8;
-const RUN_SPEED = 14;
-const AIR_SPEED = 16;
+const WALK_SPEED = 13.5;
+const RUN_SPEED = 23.5;
+const AIR_SPEED = 25;
+
 const GRAVITY = 26;
-const THRUST = 50;
-const MAX_RISE = 14;
+const THRUST = 75;
+const MAX_RISE = 21;
 const MAX_ALTITUDE = 90;
 /** Fuel is 0..1: a full tank lasts about 3.5 s of thrust. */
 const FUEL_DRAIN = 0.28;
 const FUEL_REGEN_GROUND = 0.4;
 const FUEL_REGEN_AIR = 0.08;
 const MOUSE_SENS = 0.0025;
-const FIRE_INTERVAL = 0.07;
+export const FIRE_INTERVAL = 0.07;
 const SPREAD = 0.015;
-/** How long a weapon from a crate lasts. */
-export const SPECIAL_TIME = 30;
-export type Special = "laser" | "tesla";
-export const SPECIALS: Record<Special, { name: string; color: string }> = {
-  laser: { name: "Лазер", color: "#ff2a6d" },
-  tesla: { name: "Тесла-пушка", color: "#4aa8ff" },
+export type Special = "laser" | "tesla" | "shawarma";
+/** Weapons from crates: full and short names, colour, and how many seconds each lasts. */
+export const SPECIALS: Record<Special, { name: string; short: string; color: string; time: number }> = {
+  laser: { name: "Лазер", short: "Лазер", color: "#ff2a6d", time: 30 },
+  tesla: { name: "Тесла-пушка", short: "Тесла", color: "#4aa8ff", time: 15 },
+  shawarma: { name: "Шаурмбастер", short: "Шаурма", color: "#ffb347", time: 25 },
 };
 /** Q in the air: dive straight down at this speed. */
 const DIVE_SPEED = 48;
@@ -49,6 +50,11 @@ export class Player {
   /** Level of each upgrade taken so far. */
   readonly levels = new Map<string, number>();
   hp = 100;
+  /** Force field over the hull: soaks up hits first, recharges after a pause. */
+  shield = 60;
+  private sinceHit = 99;
+  /** Length of the current crate weapon (for the indicator). */
+  specialMax = 30;
   alive = true;
   fuel = 1;
   thrusting = false;
@@ -82,6 +88,9 @@ export class Player {
   /** Where the jet pack's flames come out. */
   private nozzles: TransformNode[];
   private vel = Vector3.Zero();
+  /** Seconds until Q can be used again, and whether a dive is under way. */
+  diveCd = 0;
+  private diving = false;
   private vy = 0;
   private onGround = true;
   private sinceThrust = 10;
@@ -105,12 +114,37 @@ export class Player {
     this.jets = [fx.jet(), fx.jet(), fx.jet(), fx.jet()];
   }
 
+  get maxShield() {
+    return this.stats.maxShield;
+  }
+
+  /**
+   * Takes a hit. Enemy fire goes into the shield first and only what gets through dents the hull;
+   * a hard landing hits the hull directly. Returns how much the hull lost.
+   */
+  takeHit(dmg: number, throughShield: boolean) {
+    this.sinceHit = 0;
+    let hull = dmg;
+    if (throughShield) {
+      const soaked = Math.min(this.shield, dmg);
+      this.shield -= soaked;
+      hull -= soaked;
+    }
+    this.hp = Math.max(0, this.hp - hull);
+    return hull;
+  }
+
   get maxHp() {
     return this.stats.maxHp;
   }
 
   get grounded() {
     return this.onGround;
+  }
+
+  /** Horizontal velocity (enemies lead their shots with it). */
+  get velocity() {
+    return this.vel;
   }
 
   chest() {
@@ -139,6 +173,8 @@ export class Player {
     this.stats = baseStats();
     this.levels.clear();
     this.hp = this.maxHp;
+    this.shield = this.maxShield;
+    this.sinceHit = 99;
     this.fuel = 1;
     this.alive = true;
     this.yaw = this.facing = 0;
@@ -147,6 +183,8 @@ export class Player {
     this.special = null;
     this.specialT = 0;
     this.deathT = -1;
+    this.diveCd = 0;
+    this.diving = false;
     this.mech.root.setEnabled(true);
     for (const g of this.guns) g.setEnabled(true);
     this.mech.root.position.copyFrom(this.pos);
@@ -156,7 +194,7 @@ export class Player {
   upgrade(u: Upgrade) {
     u.apply(this.stats);
     this.levels.set(u.id, (this.levels.get(u.id) ?? 0) + 1);
-    if (u.id === "armor") this.hp = this.maxHp;
+    if (u.repair) this.hp = Math.min(this.maxHp, this.hp + this.maxHp * u.repair);
   }
 
   /** Moves the hero somewhere else, keeping health, upgrades and weapons. */
@@ -171,7 +209,7 @@ export class Player {
 
   giveSpecial(kind: Special) {
     this.special = kind;
-    this.specialT = SPECIAL_TIME;
+    this.specialT = this.specialMax = SPECIALS[kind].time + this.stats.specialBonus;
   }
 
   die() {
@@ -208,13 +246,23 @@ export class Player {
     const k = 1 - Math.exp(-(this.onGround ? 10 : 4) * dt);
     this.vel.x += (mx * speed - this.vel.x) * k;
     this.vel.z += (mz * speed - this.vel.z) * k;
-    this.pos.x += this.vel.x * dt;
-    this.pos.z += this.vel.z * dt;
+    // In small steps, so at speed the hero can't tunnel through a crate.
+    const steps = Math.max(1, Math.ceil((Math.hypot(this.vel.x, this.vel.z) * dt) / 0.8));
+    for (let i = 0; i < steps; i++) {
+      this.pos.x += (this.vel.x * dt) / steps;
+      this.pos.z += (this.vel.z * dt) / steps;
+      if (steps > 1) city.collide(this.pos, this.radius);
+    }
 
-    // Q in the air: cut the jets and drop like a stone, for a harder landing.
-    if (this.alive && !this.onGround && input.down("KeyQ")) this.vy = Math.min(this.vy, -DIVE_SPEED);
+    // Q in the air: cut the jets and drop like a stone, for a harder landing. Then it recharges.
+    this.diveCd = Math.max(0, this.diveCd - dt);
+    if (this.alive && !this.onGround && this.diveCd === 0 && input.pressed("KeyQ")) {
+      this.diving = true;
+      this.diveCd = this.stats.diveCooldown;
+    }
+    if (this.diving) this.vy = Math.min(this.vy, -DIVE_SPEED);
     // Space fires the leg jets: hold to climb, tap to hover, release to drop.
-    const wantThrust = this.alive && input.down("Space") && !input.down("KeyQ");
+    const wantThrust = this.alive && input.down("Space") && !this.diving;
     this.thrusting = wantThrust && this.fuel > (this.thrusting ? 0 : 0.08);
     if (this.thrusting) {
       this.vy = Math.min(MAX_RISE, this.vy + THRUST * dt);
@@ -236,6 +284,7 @@ export class Player {
     this.onGround = this.pos.y <= floor;
     if (this.onGround && wasAirborne && this.vy < -6) this.landed = -this.vy;
     if (this.onGround && wasAirborne) this.fell = this.apex - floor;
+    if (this.onGround) this.diving = false;
     if (this.onGround) this.apex = floor;
     if (this.onGround) {
       this.pos.y = floor;
@@ -247,6 +296,8 @@ export class Player {
     this.specialT = Math.max(0, this.specialT - dt);
     if (this.specialT === 0) this.special = null;
     if (this.alive) this.hp = Math.min(this.maxHp, this.hp + this.stats.regen * dt);
+    this.sinceHit += dt;
+    if (this.alive && this.sinceHit > this.stats.shieldDelay) this.shield = Math.min(this.maxShield, this.shield + this.stats.shieldRegen * dt);
   }
 
   /**

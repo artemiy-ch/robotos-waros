@@ -12,9 +12,18 @@ import {
   StandardMaterial,
   Texture,
   TransformNode,
+  Matrix,
+  VertexBuffer,
 } from "@babylonjs/core";
 import "@babylonjs/loaders/glTF";
 import { clamp } from "./util";
+
+/** Wrecked cars ("Free Low Poly Vehicles Pack" by Rgsdev, CC0), with their real lengths in metres. */
+export type VehicleName = "Bus" | "Sedan" | "Taxi" | "Pickup" | "Van" | "Truck" | "Ambulance" | "Police_Sedan" | "SUV" | "Hatchback";
+export const VEHICLES: [VehicleName, number][] = [
+  ["Sedan", 4.7], ["Taxi", 4.7], ["Hatchback", 4.1], ["SUV", 4.9], ["Police_Sedan", 4.8],
+  ["Pickup", 5.4], ["Van", 5.2], ["Ambulance", 6], ["Truck", 8.5], ["Bus", 11.5],
+];
 
 /**
  * Animated models, all facing +Z:
@@ -178,6 +187,8 @@ export class Models {
   private rigs = new Map<RigName, AssetContainer>();
   private props = new Map<PropName, AssetContainer>();
   private ship: AssetContainer | null = null;
+  /** One merged, vertex-coloured mesh per vehicle, length along +Z, wheels on y = 0; never drawn itself. */
+  readonly vehicles = new Map<VehicleName, Mesh>();
 
   constructor(private scene: Scene, private shadows: ShadowGenerator) {}
 
@@ -209,25 +220,7 @@ export class Models {
     };
     const loadHero = async () => {
       const c = await LoadAssetContainerAsync(`${base}Hero.glb`, this.scene);
-      // Repainted: black metal armour, chrome joints, orange wings (they also light the chest core).
-      // [colour, metallic, roughness, how much of the sky it reflects]
-      const paint: Record<string, [string, number, number, number]> = {
-        Dumb: ["#0b0c0e", 0.85, 0.3, 0.3],
-        "Rock n roll racing": ["#1d1f23", 0.85, 0.38, 0.3],
-        "The guy": ["#050506", 0.8, 0.5, 0.2],
-        Stupid: ["#a3a8b0", 1, 0.22, 1],
-        "Does not work": ["#ff6a14", 0.4, 0.4, 0.5],
-      };
-      for (const m of c.materials) {
-        if (!(m instanceof PBRMaterial)) continue;
-        const p = paint[m.name];
-        if (!p) continue;
-        m.albedoColor = Color3.FromHexString(p[0]);
-        m.metallic = p[1];
-        m.roughness = p[2];
-        m.environmentIntensity = p[3];
-        if (m.name === "Does not work") m.emissiveColor = Color3.FromHexString("#ff5a00").scale(0.45);
-      }
+      // Painted later, in the skin picked on the start screen (skins.ts).
       this.rigs.set("Hero", c);
     };
     const loadShip = async (texture: string, tint: Color3, glow?: Color3) => {
@@ -240,7 +233,43 @@ export class Models {
       for (const mesh of c.meshes) if (mesh.material) mesh.material = m;
       return c;
     };
+    const loadVehicle = async ([name, length]: [VehicleName, number]) => {
+      const c = await LoadAssetContainerAsync(`${base}cars/${name}.glb`, this.scene);
+      c.addAllToScene();
+      const parts = c.meshes.filter((m): m is Mesh => m instanceof Mesh && m.getTotalVertices() > 0);
+      // The pack has no textures, just a colour per material: bake those into the vertices,
+      // so a whole car is a single mesh and every car of a kind can be one draw call.
+      for (const m of parts) {
+        const color = ((m.material as PBRMaterial | null)?.albedoColor ?? new Color3(0.5, 0.5, 0.5)).toGammaSpace();
+        const n = m.getTotalVertices();
+        const colors = new Float32Array(n * 4);
+        for (let i = 0; i < n; i++) colors.set([color.r, color.g, color.b, 1], i * 4);
+        m.setVerticesData(VertexBuffer.ColorKind, colors);
+        for (const kind of [VertexBuffer.UVKind, VertexBuffer.UV2Kind, VertexBuffer.TangentKind]) if (m.isVerticesDataPresent(kind)) m.removeVerticesData(kind);
+        m.computeWorldMatrix(true);
+      }
+      const car = Mesh.MergeMeshes(parts, true, true)!;
+      for (const n of [...c.transformNodes]) n.dispose();
+      for (const m of c.meshes) if (!m.isDisposed() && m !== car) m.dispose();
+      for (const mat of c.materials) mat.dispose();
+      // Long side along Z, centred, standing on the ground, at its real length.
+      car.refreshBoundingInfo();
+      let { minimum: min, maximum: max } = car.getBoundingInfo().boundingBox;
+      if (max.x - min.x > max.z - min.z) {
+        car.bakeTransformIntoVertices(Matrix.RotationY(Math.PI / 2));
+        car.refreshBoundingInfo();
+        ({ minimum: min, maximum: max } = car.getBoundingInfo().boundingBox);
+      }
+      const k = length / (max.z - min.z);
+      car.bakeTransformIntoVertices(Matrix.Translation(-(min.x + max.x) / 2, -min.y, -(min.z + max.z) / 2).multiply(Matrix.Scaling(k, k, k)));
+      car.refreshBoundingInfo();
+      car.name = `vehicle-${name}`;
+      car.material = null;
+      car.setEnabled(false);
+      this.vehicles.set(name, car);
+    };
     await Promise.all([
+      ...VEHICLES.map(loadVehicle),
       loadHero(),
       ...MECHS.map(loadMech),
       ...BOTS.map(async (n) => this.rigs.set(n, await loadKit(`Enemy_${n}`))),

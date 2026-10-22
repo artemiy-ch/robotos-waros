@@ -18,6 +18,9 @@ interface Prop {
 
 const PROP_SCALE = 2;
 const BARREL_HP = 3;
+
+/** Adds a box to the list if there is one; says whether there was. */
+const keep = (list: Box[], box: Box | null) => !!box && list.push(box) > 0;
 const BARREL_RADIUS = 9;
 const MINES = 22;
 /** How close a walking enemy has to come to set a mine off. */
@@ -52,9 +55,9 @@ export class Props {
           const at = (t: number) => (alongX ? new Vector3(x0 + t * BLOCK, 0, edge) : new Vector3(edge, 0, z0 + t * BLOCK));
           const crates: PropName[] = ["Crate", "Crate_Tarp", "Crate_Large"];
           const crate = crates[Math.floor(rand() * crates.length)];
-          boxes.push(this.place("crate", crate, at(along), alongX ? 0 : Math.PI / 2));
+          keep(boxes, this.place("crate", crate, at(along), alongX ? 0 : Math.PI / 2));
           const barrels = 1 + Math.floor(rand() * 2);
-          for (let b = 0; b < barrels; b++) boxes.push(this.place("barrel", "Barrel1", at(along + (crate === "Crate_Large" ? 0.15 : 0.1) + b * 0.06), rand() * 6));
+          for (let b = 0; b < barrels; b++) keep(boxes, this.place("barrel", "Barrel1", at(along + (crate === "Crate_Large" ? 0.15 : 0.1) + b * 0.06), rand() * 6));
         }
       }
     }
@@ -82,18 +85,18 @@ export class Props {
         const turn = (Math.floor(rand() * 4) * Math.PI) / 2;
         const s = Math.sin(turn), co = Math.cos(turn);
         const at = (dx: number, dz: number) => new Vector3(ox + dx * co + dz * s, 0, oz - dx * s + dz * co);
-        boxes.push(this.place("deco", "Crate_Tarp_Large", at(0, 0), turn));
-        boxes.push(this.place("deco", "Ammo_Closed", at(4.6, -1), turn + 0.2));
-        boxes.push(this.place("deco", "Ammo", at(4.8, 1.3), turn - 0.3));
-        boxes.push(this.place("deco", "Barrel2_Closed", at(-4.6, 0.9), rand() * 6));
-        boxes.push(this.place("deco", "Barrel2_Open", at(-4.5, -1.1), rand() * 6));
-        boxes.push(this.place("deco", "Locker", at(-1.4, -3.4), turn));
-        boxes.push(this.place("deco", "Locker", at(0.7, -3.4), turn));
+        keep(boxes, this.place("deco", "Crate_Tarp_Large", at(0, 0), turn));
+        keep(boxes, this.place("deco", "Ammo_Closed", at(4.6, -1), turn + 0.2));
+        keep(boxes, this.place("deco", "Ammo", at(4.8, 1.3), turn - 0.3));
+        keep(boxes, this.place("deco", "Barrel2_Closed", at(-4.6, 0.9), rand() * 6));
+        keep(boxes, this.place("deco", "Barrel2_Open", at(-4.5, -1.1), rand() * 6));
+        keep(boxes, this.place("deco", "Locker", at(-1.4, -3.4), turn));
+        keep(boxes, this.place("deco", "Locker", at(0.7, -3.4), turn));
         if (rand() < 0.5) {
-          boxes.push(this.place("deco", "Desk_L", at(1, 5.5), turn));
-          boxes.push(this.place("deco", "Chair", at(1.6, 4.4), turn + Math.PI));
-          boxes.push(this.place("deco", "Shelves_WideTall", at(-4, 5), turn));
-        } else boxes.push(this.place("deco", "Shelves_ThinShort", at(-3, 4), turn));
+          keep(boxes, this.place("deco", "Desk_L", at(1, 5.5), turn));
+          keep(boxes, this.place("deco", "Chair", at(1.6, 4.4), turn + Math.PI));
+          keep(boxes, this.place("deco", "Shelves_WideTall", at(-4, 5), turn));
+        } else keep(boxes, this.place("deco", "Shelves_ThinShort", at(-3, 4), turn));
       }
     }
   }
@@ -109,7 +112,7 @@ export class Props {
       if ((t + HALF) % STEP < ROAD + 2) continue; // not in the crossings
       const curb = road + (rand() < 0.5 ? -1 : 1) * (ROAD / 2 - 1.2);
       const pos = rand() < 0.5 ? new Vector3(curb, 0, t) : new Vector3(t, 0, curb);
-      boxes.push(this.place("deco", items[Math.floor(rand() * items.length)], pos, rand() * 6));
+      keep(boxes, this.place("deco", items[Math.floor(rand() * items.length)], pos, rand() * 6));
     }
   }
 
@@ -124,8 +127,7 @@ export class Props {
       if ((t + HALF) % STEP < ROAD + 3) continue;
       const lane = road + (rand() - 0.5) * 6;
       const pos = rand() < 0.5 ? new Vector3(lane, 0, t) : new Vector3(t, 0, lane);
-      boxes.push(this.place("mine", "Mine", pos, rand() * 6));
-      placed++;
+      if (keep(boxes, this.place("mine", "Mine", pos, rand() * 6))) placed++;
     }
   }
 
@@ -139,6 +141,11 @@ export class Props {
     p.root.computeWorldMatrix(true);
     const { min, max } = p.root.getHierarchyBoundingVectors(true);
     const box: Box = { minX: min.x, maxX: max.x, minZ: min.z, maxZ: max.z, h: max.y };
+    // Not inside a wrecked car or a barricade.
+    if (this.city.boxes.some((o) => !o.building && box.minX < o.maxX && box.maxX > o.minX && box.minZ < o.maxZ && box.maxZ > o.minZ)) {
+      p.dispose();
+      return null;
+    }
     const prop: Prop = { kind, root: p.root, dispose: p.dispose, box, hp: BARREL_HP, building: null };
     this.list.push(prop);
     this.byBox.set(box, prop);

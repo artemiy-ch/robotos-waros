@@ -55,9 +55,11 @@ export class Loot {
       mech.anim.play("Idle_Closed", { instant: true });
       mech.root.position.set(x, 0, z);
       mech.root.rotation.y = Math.random() * Math.PI * 2;
-      // Lasers mostly: always one tesla gun on the map, sometimes a second.
-      const teslas = this.crates.filter((c) => c.opened < 0 && c.weapon === "tesla").length;
-      const weapon: Special = teslas === 0 || (teslas === 1 && Math.random() < 0.3) ? "tesla" : "laser";
+      // Lasers mostly: always one tesla gun and one shawarma buster on the map, sometimes a second of either.
+      const count = (w: Special) => this.crates.filter((c) => c.opened < 0 && c.weapon === w).length;
+      const teslas = count("tesla"), busters = count("shawarma"), r = Math.random();
+      const weapon: Special =
+        teslas === 0 ? "tesla" : busters === 0 ? "shawarma" : r < 0.15 && teslas < 2 ? "tesla" : r > 0.8 && busters < 2 ? "shawarma" : "laser";
       const beacon = MeshBuilder.CreateCylinder("crateBeacon", { diameter: 0.7, height: 40, tessellation: 8 }, this.scene);
       beacon.material = this.beaconMaterials.get(weapon)!;
       beacon.position.set(x, 20, z);
@@ -94,7 +96,7 @@ export class Loot {
         c.beacon.setEnabled(false);
         p.giveSpecial(c.weapon);
         g.sfx.powerup();
-        g.hud.banner(`${SPECIALS[c.weapon].name} · 30 сек`, 2);
+        g.hud.banner(`${SPECIALS[c.weapon].name} · ${Math.round(p.specialMax)} сек`, 2);
         g.fx.spark(c.pos.add(new Vector3(0, 2, 0)), 30);
         continue;
       }

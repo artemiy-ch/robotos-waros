@@ -214,6 +214,74 @@ body {
   margin-bottom: 22px;
   line-height: 1.5;
 }
+#pilot {
+  margin: -6px 0 24px;
+  cursor: default;
+}
+#pilot.hidden,
+#pilot-row.hidden {
+  display: none;
+}
+#nick {
+  display: block;
+  width: 260px;
+  margin: 0 auto 16px;
+  padding: 9px 14px;
+  font: inherit;
+  font-size: 17px;
+  text-align: center;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+  outline: none;
+}
+#nick:focus {
+  border-color: #3ee8ff;
+}
+.skins {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+}
+.skin {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  width: 96px;
+  padding: 10px 6px 8px;
+  font: inherit;
+  font-size: 14px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.06);
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  border-radius: 10px;
+  cursor: pointer;
+}
+.skin:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.skin.selected {
+  border-color: #3ee8ff;
+  background: rgba(62, 232, 255, 0.12);
+}
+.skin i {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+.skin[data-skin="dark"] i {
+  background: linear-gradient(160deg, #2a2d33, #08090b 55%, #ff6a14 56%, #ff6a14 68%, #08090b 69%);
+}
+.skin[data-skin="light"] i {
+  background: linear-gradient(160deg, #ffffff, #c4c9d1 55%, #ff6a14 56%, #ff6a14 68%, #c4c9d1 69%);
+}
+.skin[data-skin="rainbow"] i {
+  background: linear-gradient(#e40303 0 16.6%, #ff8c00 0 33.3%, #ffed00 0 50%, #008026 0 66.6%, #004dff 0 83.3%, #750787 0);
+}
+
 .controls {
   list-style: none;
   display: grid;
@@ -373,4 +441,137 @@ kbd {
   margin-top: 6px !important;
   font-size: 11px !important;
   opacity: 0.4;
+}
+
+#dive-fill {
+  height: 100%;
+  width: 100%;
+  background: #b98cff;
+}
+#dive-fill.ready {
+  background: #d9b8ff;
+  box-shadow: 0 0 8px #b98cff;
+}
+
+#callout {
+  position: absolute;
+  top: 38%;
+  width: 100%;
+  text-align: center;
+  font-size: 46px;
+  font-weight: 900;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: #ffcf4a;
+  text-shadow: 0 0 18px rgba(255, 140, 20, 0.8), 0 3px 6px #000;
+  opacity: 0;
+}
+#callout.show {
+  animation: callout 1.3s ease-out forwards;
+}
+@keyframes callout {
+  0% { opacity: 0; transform: scale(1.8); }
+  12% { opacity: 1; transform: scale(1); }
+  75% { opacity: 1; transform: scale(1.04); }
+  100% { opacity: 0; transform: scale(1.1); }
+}
+
+#popups {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.popup {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  font-size: 16px;
+  font-weight: 800;
+  color: #ffe08a;
+  text-shadow: 0 2px 4px #000;
+  white-space: nowrap;
+  animation: popup 0.9s ease-out forwards;
+}
+.popup.big {
+  font-size: 26px;
+  color: #ff9a3c;
+}
+@keyframes popup {
+  0% { opacity: 0; margin-top: 0; }
+  15% { opacity: 1; }
+  100% { opacity: 0; margin-top: -60px; }
+}
+
+#combo {
+  position: absolute;
+  right: 20px;
+  top: 216px;
+  width: 180px;
+  text-align: right;
+}
+#combo.hidden {
+  display: none;
+}
+#combo-text {
+  font-size: 20px;
+  font-weight: 900;
+  color: #ffcf4a;
+  text-shadow: 0 2px 6px #000;
+}
+#combo-bar {
+  height: 5px;
+  margin-top: 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.15);
+  overflow: hidden;
+}
+#combo-fill {
+  height: 100%;
+  background: #ffcf4a;
+}
+
+#shield-fill {
+  height: 100%;
+  width: 100%;
+  background: #3ec8ff;
+  box-shadow: 0 0 8px #3ec8ff;
+  transition: width 0.15s;
+}
+#shield-fill.charging {
+  background: #2a7fa8;
+  box-shadow: none;
+}
+#shield-text {
+  min-width: 32px;
+  font-size: 16px;
+  color: #7fdcff;
+}
+#shield-hit {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at center, transparent 50%, rgba(60, 190, 255, 0.55) 100%);
+  opacity: 0;
+}
+
+/* A glow round the whole screen while a crate weapon is in hand, pulsing as it runs out. */
+#aura {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  box-shadow: inset 0 0 110px 24px var(--aura, #ff2a6d);
+}
+
+
+.upgrade.legendary {
+  border-color: #ffc93c;
+  background: linear-gradient(160deg, rgba(60, 40, 8, 0.92), rgba(18, 14, 8, 0.92));
+  box-shadow: 0 0 26px rgba(255, 190, 40, 0.45);
+}
+.upgrade.legendary b {
+  color: #ffd85a;
+}
+.upgrade.legendary .tag {
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #ffc93c;
 }

@@ -80,7 +80,8 @@ export class HeroRig {
     const speed = Math.hypot(s.forward, s.side);
     const walking = s.grounded && speed > 0.5 && s.dead < 0;
     const dir = s.forward < -0.5 ? -1 : 1;
-    if (walking) this.phase += (dt * speed * Math.PI) / STRIDE;
+    // Longer strides at speed, so the legs don't blur.
+    if (walking) this.phase += (dt * speed * Math.PI) / (STRIDE + speed * 0.09);
     const amp = walking ? Math.min(1, speed / 9) : 0;
     const swing = Math.sin(this.phase) * 0.55 * amp * dir;
     const kneeL = -0.9 * amp * Math.max(0, Math.sin(this.phase + 1.2 * dir));

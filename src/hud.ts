@@ -1,6 +1,7 @@
+import { SKINS, type Skin } from "./skins";
 import { HALF, SIZE, type City } from "./city";
 import type { Game } from "./game";
-import { SPECIAL_TIME, SPECIALS } from "./player";
+import { SPECIALS } from "./player";
 import type { Upgrade } from "./upgrades";
 
 const byId = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -8,6 +9,13 @@ const byId = <T extends HTMLElement = HTMLElement>(id: string) => document.getEl
 export class Hud {
   private hpFill = byId("hp-fill");
   private hpText = byId("hp-text");
+  private shieldFill = byId("shield-fill");
+  private shieldText = byId("shield-text");
+  private shieldHitEl = byId("shield-hit");
+  private shieldHitT = 0;
+  private aura = byId("aura");
+  private auraLevel = 0;
+  private auraT = 0;
   private rocketFill = byId("rocket-fill");
   private fuelFill = byId("fuel-fill");
   private laserRow = byId("laser-row");
@@ -28,10 +36,20 @@ export class Hud {
   private fadeEl = byId("fade");
   private warningEl = byId("warning");
   private warningT = 0;
+  private calloutEl = byId("callout");
+  private popupsEl = byId("popups");
+  private combo = byId("combo");
+  private comboText = byId("combo-text");
+  private comboFill = byId("combo-fill");
+  private diveFill = byId("dive-fill");
   private bannerEl = byId("banner");
   private overlay = byId("overlay");
   private ovTitle = byId("ov-title");
   private ovText = byId("ov-text");
+  private pilot = byId("pilot");
+  private nick = byId<HTMLInputElement>("nick");
+  private pilotRow = byId("pilot-row");
+  private pilotName = byId("pilot-name");
   private map = byId<HTMLCanvasElement>("minimap");
   private mapCtx = this.map.getContext("2d")!;
   private mapBg = document.createElement("canvas");
@@ -62,10 +80,41 @@ export class Hud {
     this.overlay.addEventListener("click", fn);
   }
 
-  showOverlay(title: string, html: string) {
+  /** The start/end screen; `pilot` also shows the nickname and skin picker. */
+  showOverlay(title: string, html: string, pilot = false) {
     this.ovTitle.textContent = title;
     this.ovText.innerHTML = html;
+    this.pilot.classList.toggle("hidden", !pilot);
     this.overlay.classList.remove("hidden");
+  }
+
+  /** Fills in the picker and calls back whenever the name or the skin changes. */
+  setupPilot(nick: string, skin: Skin, onChange: (nick: string, skin: Skin) => void) {
+    let current = skin;
+    const buttons = [...this.pilot.querySelectorAll<HTMLButtonElement>(".skin")];
+    const select = () => buttons.forEach((b) => b.classList.toggle("selected", b.dataset.skin === current));
+    const changed = () => {
+      const name = this.nick.value.trim().slice(0, 16);
+      this.pilotName.textContent = name;
+      this.pilotRow.classList.toggle("hidden", !name);
+      onChange(name, current);
+    };
+    this.nick.value = nick;
+    select();
+    // Clicks in here pick things; they must not start the game.
+    this.pilot.addEventListener("click", (e) => e.stopPropagation());
+    this.nick.addEventListener("input", changed);
+    this.nick.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") this.nick.blur();
+    });
+    for (const b of buttons) {
+      b.addEventListener("click", () => {
+        if (SKINS.includes(b.dataset.skin as Skin)) current = b.dataset.skin as Skin;
+        select();
+        changed();
+      });
+    }
+    changed();
   }
 
   hideOverlay() {
@@ -76,8 +125,32 @@ export class Hud {
     this.hitT = 0.12;
   }
 
+  /** A blue flash at the screen edges: the shield took the hit. */
+  shieldHit() {
+    this.shieldHitT = Math.min(0.8, this.shieldHitT + 0.4);
+  }
+
   damage() {
     this.dmgT = Math.min(1, this.dmgT + 0.6);
+  }
+
+  /** A big kill-streak shout in the middle of the screen. */
+  callout(text: string) {
+    this.calloutEl.textContent = text;
+    this.calloutEl.classList.remove("show");
+    void this.calloutEl.offsetWidth; // restart the animation
+    this.calloutEl.classList.add("show");
+  }
+
+  /** Points floating up from a kill, at screen position (x, y). */
+  popup(x: number, y: number, text: string, big: boolean) {
+    const el = document.createElement("div");
+    el.className = big ? "popup big" : "popup";
+    el.textContent = text;
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    this.popupsEl.append(el);
+    setTimeout(() => el.remove(), 950);
   }
 
   /** A red, blinking alert under the boss bar. */
@@ -100,9 +173,10 @@ export class Hud {
     this.upgradeCards.replaceChildren(
       ...options.map((u, i) => {
         const card = document.createElement("div");
-        card.className = "upgrade";
+        card.className = u.legendary ? "upgrade legendary" : "upgrade";
         const level = levels.get(u.id) ?? 0;
-        card.innerHTML = `<kbd>${i + 1}</kbd><b></b><span></span><small>уровень ${level} → ${level + 1} из ${u.max}</small>`;
+        const foot = u.legendary ? `<small class="tag">трофей босса</small>` : `<small>уровень ${level} → ${level + 1} из ${u.max}</small>`;
+        card.innerHTML = `<kbd>${i + 1}</kbd><b></b><span></span>${foot}`;
         card.querySelector("b")!.textContent = u.name;
         card.querySelector("span")!.textContent = u.text;
         return card;
@@ -125,17 +199,38 @@ export class Hud {
     this.hpFill.style.width = `${hp * 100}%`;
     this.hpFill.style.background = hp > 0.5 ? "#4be37a" : hp > 0.25 ? "#ffc23d" : "#ff4b4b";
     this.hpText.textContent = String(Math.ceil(g.player.hp));
+    const p = g.player;
+    this.shieldFill.style.width = `${(p.shield / p.maxShield) * 100}%`;
+    this.shieldFill.classList.toggle("charging", p.shield < p.maxShield);
+    this.shieldText.textContent = String(Math.ceil(p.shield));
+    this.shieldHitT = Math.max(0, this.shieldHitT - dt * 2.5);
+    this.shieldHitEl.style.opacity = String(this.shieldHitT);
     const ready = 1 - g.player.rocketCd / g.player.stats.rocketCooldown;
     this.rocketFill.style.width = `${ready * 100}%`;
     this.rocketFill.classList.toggle("ready", ready >= 1);
     this.fuelFill.style.width = `${g.player.fuel * 100}%`;
     this.fuelFill.classList.toggle("low", g.player.fuel < 0.2);
+    const dive = 1 - g.player.diveCd / g.player.stats.diveCooldown;
+    this.diveFill.style.width = `${dive * 100}%`;
+    this.diveFill.classList.toggle("ready", dive >= 1);
+    this.combo.classList.toggle("hidden", g.streak < 2);
+    if (g.streak >= 2) {
+      this.comboText.textContent = `Серия ${g.streak} · ×${g.multiplier}`;
+      this.comboFill.style.width = `${(g.streakT / 3) * 100}%`;
+    }
     const special = g.player.special;
     this.laserRow.classList.toggle("hidden", !special);
+    // Glow round the screen while a crate weapon is in hand; it pulses in its last seconds.
+    this.auraT += dt;
+    const left = g.player.specialT;
+    const glow = !special ? 0 : left < 4 ? 0.15 + 0.75 * (0.5 + 0.5 * Math.sin(this.auraT * (14 - left * 2))) : 0.55;
+    this.auraLevel += (glow - this.auraLevel) * Math.min(1, dt * (left < 4 ? 30 : 4));
+    this.aura.style.opacity = String(this.auraLevel);
     if (special) {
-      const { name, color } = SPECIALS[special];
-      this.laserLabel.textContent = special === "laser" ? name : "Тесла";
-      this.laserFill.style.width = `${(g.player.specialT / SPECIAL_TIME) * 100}%`;
+      const { short, color } = SPECIALS[special];
+      this.aura.style.setProperty("--aura", color);
+      this.laserLabel.textContent = short;
+      this.laserFill.style.width = `${(g.player.specialT / g.player.specialMax) * 100}%`;
       this.laserFill.style.background = color;
       this.laserFill.style.boxShadow = `0 0 8px ${color}`;
       this.laserText.style.color = color;

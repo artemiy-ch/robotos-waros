@@ -1,6 +1,7 @@
 import { Color3, DynamicTexture, Matrix, Mesh, MeshBuilder, Quaternion, Scene, StandardMaterial, Texture, Vector3, Vector4, VertexBuffer } from "@babylonjs/core";
 import { HALF, SIZE, type Building } from "./city";
 import { mat } from "./util";
+import { block, cylinder, dome as domeShape, union, type Shape } from "./shapes";
 
 /** Station plating: light panels with seams, and a dark band where the windows are. */
 export function panelTexture(scene: Scene) {
@@ -71,6 +72,7 @@ export function moonBuilding(scene: Scene, b: Building, glass: StandardMaterial,
   };
   const shell = b.mesh.material as StandardMaterial;
   const style = h < 16 ? "dome" : Math.abs(w - d) < 3 && seed % 3 !== 0 ? "tower" : "modules";
+  let shape: Shape;
 
   if (style === "dome") {
     // A plated ring wall with a glass dome on it.
@@ -79,6 +81,7 @@ export function moonBuilding(scene: Scene, b: Building, glass: StandardMaterial,
     const dome = at(MeshBuilder.CreateSphere("dome", { diameter: r * 2, segments: 20, slice: 0.5 }, scene), wall);
     dome.scaling.y = (h - wall) / r;
     dome.material = glass;
+    shape = union(cylinder(b.cx, b.cz, r, 0, wall), domeShape(b.cx, wall, b.cz, r, h - wall, r));
   } else if (style === "tower") {
     const cap = r * 0.9;
     const body = h - cap * 0.6;
@@ -90,6 +93,7 @@ export function moonBuilding(scene: Scene, b: Building, glass: StandardMaterial,
     top.scaling.y = 0.6;
     top.material = glass;
     at(MeshBuilder.CreateCylinder("mast", { diameter: 0.4, height: 8, tessellation: 6 }, scene), body + cap * 0.55 + 4).material = metal;
+    shape = union(cylinder(b.cx, b.cz, r * 0.9, 0, body), domeShape(b.cx, body, b.cz, cap, cap * 0.6, cap));
   } else {
     // Habitat modules: a wide base, a narrower block on top, and a pipe up the side.
     const lower = h * (0.45 + (seed % 4) * 0.08);
@@ -99,11 +103,13 @@ export function moonBuilding(scene: Scene, b: Building, glass: StandardMaterial,
     at(MeshBuilder.CreateCylinder("pipe", { diameter: 1.2, height: h, tessellation: 10 }, scene), h / 2, w / 2 - 0.4, 0).material = metal;
     const deck = at(MeshBuilder.CreateBox("deck", { width: w + 0.6, depth: d + 0.6, height: 0.6 }, scene), lower);
     deck.material = metal;
+    const { minX, maxX, minZ, maxZ } = b.box;
+    shape = union(block(minX, maxX, minZ, maxZ, 0, lower), block(b.cx - uw / 2, b.cx + uw / 2, b.cz - ud / 2, b.cz + ud / 2, lower, h));
   }
 
   const merged = Mesh.MergeMeshes(parts, true, true, undefined, false, true)!;
   merged.name = "moonBuilding";
-  return merged;
+  return { mesh: merged, shape };
 }
 
 /** Earth hanging in the black sky: oceans, continents and swirls of cloud. */

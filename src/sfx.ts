@@ -1,3 +1,12 @@
+/** Music in public/music (generated with ElevenLabs Music), looped with a crossfade. */
+export type Track = "calm" | "battle" | "techno1" | "techno2" | "boss";
+const TRACKS: Track[] = ["calm", "techno1", "techno2", "battle", "boss"];
+/** The fights take turns, wave by wave: two lighter techno tracks, then the heavy one. */
+export const BATTLE_TRACKS: Track[] = ["techno1", "techno2", "battle"];
+const MUSIC_VOLUME = 0.37;
+/** Seconds of overlap when one track hands over to another, or to its own next loop. */
+const CROSSFADE = 2.5;
+
 /** Recorded effects in public/sfx (generated with ElevenLabs Sound Effects). */
 const SAMPLES = ["gun", "rocket", "explosion", "explosion_big", "step_a", "step_b", "land", "laser", "powerup", "thunder_near", "thunder_far", "slam", "boss", "tesla", "warp", "victory"] as const;
 type Sample = (typeof SAMPLES)[number];
@@ -9,6 +18,11 @@ type Sample = (typeof SAMPLES)[number];
 export class Sfx {
   private ctx: AudioContext | null = null;
   private out!: GainNode;
+  private musicOut!: GainNode;
+  private tracks = new Map<Track, AudioBuffer>();
+  private playing: { track: Track; src: AudioBufferSourceNode; gain: GainNode; ends: number } | null = null;
+  private wanted: Track | null = null;
+  musicOn = true;
   private noise!: AudioBuffer;
   private samples = new Map<Sample, AudioBuffer>();
 
@@ -25,7 +39,83 @@ export class Sfx {
     this.noise = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
     const data = this.noise.getChannelData(0);
     for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    this.musicOut = ctx.createGain();
+    this.musicOut.gain.value = this.musicOn ? MUSIC_VOLUME : 0;
+    this.musicOut.connect(ctx.destination);
     void this.loadSamples(ctx);
+    void this.loadMusic(ctx);
+  }
+
+  private async loadMusic(ctx: AudioContext) {
+    for (const name of TRACKS) {
+      try {
+        const res = await fetch(`${import.meta.env.BASE_URL}music/${name}.mp3`);
+        this.tracks.set(name, await ctx.decodeAudioData(await res.arrayBuffer()));
+      } catch {
+        // No music for this one, then.
+      }
+    }
+  }
+
+  /** Which track should be playing (null for silence); call every frame. Switches and loops with crossfades. */
+  music(track: Track | null) {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    this.wanted = track;
+    const now = ctx.currentTime;
+    const p = this.playing;
+    const due = p && now > p.ends - CROSSFADE; // its loop is about to run out
+    if (p && (p.track !== track || due)) {
+      p.gain.gain.setTargetAtTime(0, now, CROSSFADE / 4);
+      p.src.stop(now + CROSSFADE + 0.5);
+      this.playing = null;
+    }
+    if (this.playing || !track) return;
+    const buffer = this.tracks.get(track);
+    if (!buffer) return;
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.setTargetAtTime(1, now, CROSSFADE / 4);
+    src.connect(gain).connect(this.musicOut);
+    src.start(now);
+    this.playing = { track, src, gain, ends: now + buffer.duration };
+  }
+
+  toggleMusic() {
+    this.musicOn = !this.musicOn;
+    if (this.ctx) this.musicOut.gain.setTargetAtTime(this.musicOn ? MUSIC_VOLUME : 0, this.ctx.currentTime, 0.1);
+  }
+
+  /** A hit soaked up by the force field: a bright electric zap. */
+  shieldHit() {
+    this.tone(1600, 700, 0.12, "triangle", 0.1);
+    this.burst(0.08, 4000, "highpass", 0.15);
+  }
+
+  /** The force field collapsing: a falling electric whine. */
+  shieldDown() {
+    this.tone(1200, 120, 0.5, "sawtooth", 0.12);
+    this.burst(0.35, 1500, "bandpass", 0.3);
+  }
+
+  /** A kamikaze's warning beep; urgency 0..1 raises the pitch. */
+  beep(urgency: number, dist: number) {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = "square";
+    osc.frequency.value = 900 + urgency * 900;
+    osc.connect(this.envelope(ctx, 0.07 * Math.max(0.2, 1 - dist / 50), 0.06));
+    osc.start(t);
+    osc.stop(t + 0.08);
+  }
+
+  /** The rising sting under a kill-streak callout; higher for bigger streaks. */
+  callout(level: number) {
+    this.play("powerup", 0.55, 1.1 + level * 0.12, 0.45);
   }
 
   private async loadSamples(ctx: AudioContext) {
@@ -92,6 +182,24 @@ export class Sfx {
     osc.connect(this.envelope(ctx, vol, dur));
     osc.start(t);
     osc.stop(t + dur + 0.05);
+  }
+
+  /** A shawarma leaving the launcher. */
+  whoosh() {
+    this.burst(0.16, 900, "bandpass", 0.18);
+    this.tone(260, 140, 0.12, "triangle", 0.06);
+  }
+
+  /** A shawarma bouncing off the ground or a wall: a cartoon boing, lower with each bounce. */
+  boing(bounce: number) {
+    this.tone(160 / bounce, 640 / bounce, 0.18, "triangle", 0.16);
+  }
+
+  /** A shawarma landing in a robot's face: "nyam-nyam". */
+  nom() {
+    this.tone(330, 520, 0.08, "square", 0.08);
+    setTimeout(() => this.tone(300, 560, 0.1, "square", 0.08), 110);
+    this.burst(0.08, 600, "lowpass", 0.2);
   }
 
   shoot() {

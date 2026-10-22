@@ -5,6 +5,7 @@ import {
   Engine,
   GlowLayer,
   HemisphericLight,
+  Matrix,
   Scene,
   ShadowGenerator,
   UniversalCamera,
@@ -22,9 +23,12 @@ import { Loot } from "./loot";
 import { Models } from "./models";
 import { Pickups } from "./pickups";
 import { Props } from "./props";
-import { Player } from "./player";
+import { FIRE_INTERVAL, Player } from "./player";
 import { Projectiles } from "./projectiles";
-import { Sfx } from "./sfx";
+import { BATTLE_TRACKS, Sfx } from "./sfx";
+import { BUSTER_EDGE, BUSTER_INTERVAL, Shawarma } from "./shawarma";
+import { SKINS, paintHero, type Skin } from "./skins";
+import { Scenery } from "./scenery";
 import { Sky } from "./sky";
 import { offer, type Upgrade } from "./upgrades";
 import { Weather } from "./weather";
@@ -44,6 +48,19 @@ const BOSS_EVERY = 5;
 const START_WAVE = Number(new URLSearchParams(location.search).get("wave")) || 1;
 /** The flagship comes on this wave; bring it down and the game is won. */
 const FINAL_WAVE = 15;
+/** Kills less than this many seconds apart make a streak; each one adds to the score multiplier. */
+const STREAK_WINDOW = 3;
+const STREAK_STEP = 0.25;
+const STREAK_MAX = 4;
+const CALLOUTS: Record<number, string> = {
+  3: "Тройное!",
+  5: "Мясорубка!",
+  8: "Неудержим!",
+  12: "Бог войны!",
+  18: "Аннигиляция!",
+  25: "Апокалипсис!",
+};
+const FOV = 0.95;
 /** Falls from higher than this hurt; from FALL_FATAL and up they cost the most (FALL_MAX of full health). */
 const FALL_SAFE = 15;
 const FALL_FATAL = 60;
@@ -60,6 +77,7 @@ const WARP_TIME = 2.6;
 
 interface Look {
   sky: Color3;
+  zenith: Color3;
   fog: number;
   hemi: number;
   hemiColor: Color3;
@@ -69,18 +87,52 @@ interface Look {
   shadow: number;
   gravity: number;
 }
-const LOOKS: Record<Theme, Look> = {
-  // Overcast, smoggy dusk.
+/** Each world by day and by night; the light changes over every two waves. */
+const LOOKS: Record<Theme, { day: Look; night: Look }> = {
   earth: {
-    sky: new Color3(0.34, 0.37, 0.42), fog: 0.0058, hemi: 0.62, hemiColor: new Color3(0.72, 0.78, 0.88), hemiGround: new Color3(0.16, 0.16, 0.18),
-    sun: 0.95, sunColor: new Color3(1, 0.78, 0.6), shadow: 0.2, gravity: 1,
+    // A grey, smoggy day.
+    day: {
+      sky: new Color3(0.5, 0.55, 0.62), zenith: new Color3(0.24, 0.3, 0.42), fog: 0.0048, hemi: 0.8, hemiColor: new Color3(0.82, 0.86, 0.94), hemiGround: new Color3(0.2, 0.2, 0.22),
+      sun: 1.25, sunColor: new Color3(1, 0.9, 0.76), shadow: 0.25, gravity: 1,
+    },
+    // Night: the city lit by neon, fires and searchlights.
+    night: {
+      sky: new Color3(0.13, 0.15, 0.2), zenith: new Color3(0.04, 0.05, 0.09), fog: 0.0062, hemi: 0.46, hemiColor: new Color3(0.5, 0.6, 0.88), hemiGround: new Color3(0.11, 0.11, 0.13),
+      sun: 0.5, sunColor: new Color3(0.6, 0.7, 1), shadow: 0.35, gravity: 1,
+    },
   },
-  // No air: black sky, hard white sunlight, deep shadows, low gravity.
   moon: {
-    sky: new Color3(0.045, 0.05, 0.065), fog: 0.0026, hemi: 0.4, hemiColor: new Color3(0.6, 0.66, 0.8), hemiGround: new Color3(0.1, 0.1, 0.11),
-    sun: 1.4, sunColor: new Color3(1, 0.98, 0.94), shadow: 0.04, gravity: 0.55,
+    // No air: black sky, hard white sunlight, deep shadows, low gravity.
+    day: {
+      sky: new Color3(0.045, 0.05, 0.065), zenith: new Color3(0.005, 0.006, 0.012), fog: 0.0026, hemi: 0.4, hemiColor: new Color3(0.6, 0.66, 0.8), hemiGround: new Color3(0.1, 0.1, 0.11),
+      sun: 1.4, sunColor: new Color3(1, 0.98, 0.94), shadow: 0.04, gravity: 0.55,
+    },
+    // Lunar night: only earthshine.
+    night: {
+      sky: new Color3(0.015, 0.018, 0.03), zenith: new Color3(0.002, 0.002, 0.006), fog: 0.0026, hemi: 0.28, hemiColor: new Color3(0.45, 0.55, 0.85), hemiGround: new Color3(0.06, 0.06, 0.07),
+      sun: 0.6, sunColor: new Color3(0.7, 0.8, 1), shadow: 0.1, gravity: 0.55,
+    },
   },
 };
+/** Seconds the sky takes to go from day to night or back. */
+const DUSK_TIME = 5;
+/** Waves 1–2 by day, 3–4 by night, and so on. */
+const isDay = (wave: number) => Math.floor((Math.max(1, wave) - 1) / 2) % 2 === 0;
+
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+const mixLook = (a: Look, b: Look, t: number): Look => ({
+  sky: Color3.Lerp(a.sky, b.sky, t),
+  zenith: Color3.Lerp(a.zenith, b.zenith, t),
+  fog: a.fog + (b.fog - a.fog) * t,
+  hemi: a.hemi + (b.hemi - a.hemi) * t,
+  hemiColor: Color3.Lerp(a.hemiColor, b.hemiColor, t),
+  hemiGround: Color3.Lerp(a.hemiGround, b.hemiGround, t),
+  sun: a.sun + (b.sun - a.sun) * t,
+  sunColor: Color3.Lerp(a.sunColor, b.sunColor, t),
+  shadow: a.shadow + (b.shadow - a.shadow) * t,
+  gravity: b.gravity,
+});
 
 export class Game {
   readonly engine: Engine;
@@ -96,15 +148,26 @@ export class Game {
   props!: Props;
   loot!: Loot;
   private beams: LaserBeam[];
+  private shawarma: Shawarma;
   private lightning: Lightning;
   private teslaT = 0;
   private teslaGun = 0;
+  private busterT = 0;
+  private busterGun = 0;
   private hemiBase = HEMI_INTENSITY;
+  /** 1 by day, 0 by night, in between at dusk and dawn; and where it is heading. */
+  private daylight = 1;
+  private dayTarget = 1;
+  /** The pilot's name and paint job, from the start screen. */
+  nick = "";
+  skin: Skin = "dark";
   /** Seconds into the move to the Moon, or -1. */
   private warp = -1;
   private sky: Sky;
   private weather: Weather;
   private crash: CrashSite | null = null;
+  private scenery: Scenery | null = null;
+  private glow: GlowLayer;
   private hemi: HemisphericLight;
   private scorchT = 0;
   readonly destruction: Destruction;
@@ -112,6 +175,12 @@ export class Game {
   enemies!: Enemies;
 
   state: State = "loading";
+  /** Game time runs this much slower than real time (hit-stop, slow motion). */
+  private timeScale = 1;
+  private hitstopT = 0;
+  private slowT = 0;
+  streak = 0;
+  streakT = 0;
   score = 0;
   wave = 0;
   private sun: DirectionalLight;
@@ -160,12 +229,12 @@ export class Game {
     shadows.darkness = 0.2;
 
     this.camera = new UniversalCamera("cam", new Vector3(0, 5, -10), scene);
-    this.camera.fov = 0.95;
+    this.camera.fov = FOV;
     this.camera.minZ = 0.1;
     this.camera.maxZ = 1200;
     this.camera.inputs.clear();
 
-    const glow = new GlowLayer("glow", scene, { blurKernelSize: 32, mainTextureRatio: 0.5 });
+    const glow = (this.glow = new GlowLayer("glow", scene, { blurKernelSize: 32, mainTextureRatio: 0.5 }));
     glow.intensity = 0.8;
 
     this.city = new City(scene, shadows);
@@ -176,6 +245,7 @@ export class Game {
     this.destruction = new Destruction(scene, this.city, shadows);
     this.beams = [new LaserBeam(scene), new LaserBeam(scene)];
     this.lightning = new Lightning(scene);
+    this.shawarma = new Shawarma(scene);
     this.models = new Models(scene, shadows);
     this.hud.onOverlayClick(() => this.onOverlayClick());
     this.fx.onExplosion = (at, scale) => {
@@ -197,24 +267,50 @@ export class Game {
     this.props = new Props(this.models, this.city);
     this.loot = new Loot(this.scene, this.models, this.city);
     this.crash = new CrashSite(this.scene, this.models, this.city, this.fx);
+    this.scenery = new Scenery(this.scene, this.models, this.city, this.fx, this.shadows, this.glow);
     this.reset();
     this.state = "menu";
-    this.hud.showOverlay("ROBOT WARS", "Город захвачен роботами. Кликни, чтобы начать");
+    // The last name and skin are remembered in this browser.
+    let saved: { nick?: string; skin?: Skin } = {};
+    try {
+      saved = JSON.parse(localStorage.getItem("pilot") ?? "{}");
+    } catch {
+      // Nothing saved, or no storage here.
+    }
+    this.hud.setupPilot(saved.nick ?? "", SKINS.includes(saved.skin as Skin) ? (saved.skin as Skin) : "dark", (nick, skin) => {
+      this.setPilot(nick, skin);
+      try {
+        localStorage.setItem("pilot", JSON.stringify({ nick, skin }));
+      } catch {
+        // Not remembered, then.
+      }
+    });
+    this.hud.showOverlay("ROBOT WARS", "Город захвачен роботами. Кликни, чтобы начать", true);
     this.engine.runRenderLoop(() => this.frame());
   }
 
   /** Repaints the whole world: city, sky, light, fog and gravity. */
   private applyTheme(theme: Theme) {
-    const look = LOOKS[theme];
-    const scene = this.scene;
     this.city.setTheme(theme);
-    this.sky.setTheme(theme, look.sky);
+    this.scenery?.setTheme(theme);
+    this.sky.setTheme(theme, LOOKS[theme].day.sky);
     this.weather.setEnabled(theme === "earth");
+    this.applyLight(true);
+  }
+
+  /** Light, sky and fog for the current world at the current time of day; the reflections only when asked (they are slow to redo). */
+  private applyLight(reflections: boolean) {
+    const looks = LOOKS[this.city.theme];
+    const look = mixLook(looks.night, looks.day, this.daylight);
+    const scene = this.scene;
+    this.sky.setColors(look.sky, look.zenith);
     scene.clearColor = new Color4(look.sky.r, look.sky.g, look.sky.b, 1);
     scene.fogColor = look.sky;
     scene.fogDensity = look.fog;
-    scene.environmentTexture?.dispose();
-    skyEnvironment(scene, look.sky);
+    if (reflections) {
+      scene.environmentTexture?.dispose();
+      skyEnvironment(scene, look.sky);
+    }
     this.hemiBase = look.hemi;
     this.hemi.diffuse = look.hemiColor;
     this.hemi.groundColor = look.hemiGround;
@@ -224,13 +320,32 @@ export class Game {
     this.player.gravity = look.gravity;
   }
 
+  /** Dusk and dawn: the light slides towards the time of day the waves call for. */
+  private updateDaylight(dt: number) {
+    if (this.daylight === this.dayTarget) return;
+    const step = dt / DUSK_TIME;
+    this.daylight = this.daylight < this.dayTarget ? Math.min(this.dayTarget, this.daylight + step) : Math.max(this.dayTarget, this.daylight - step);
+    this.applyLight(this.daylight === this.dayTarget);
+  }
+
+  /** The look picked on the start screen. */
+  setPilot(nick: string, skin: Skin) {
+    this.nick = nick;
+    if (skin !== this.skin || !this.painted) paintHero(this.player.mech, skin);
+    this.skin = skin;
+    this.painted = true;
+  }
+  private painted = false;
+
   private reset() {
+    this.daylight = this.dayTarget = isDay(START_WAVE) ? 1 : 0;
     // Starting past the first boss (when testing) means starting on the Moon.
     this.applyTheme(START_WAVE > BOSS_EVERY ? "moon" : "earth");
     this.warp = -1;
     this.hud.fade(0);
     this.enemies.clear();
     this.projectiles.clear();
+    this.shawarma.clear();
     this.pickups.clear();
     this.fx.clearScorch();
     this.destruction.clear();
@@ -240,6 +355,8 @@ export class Game {
     this.player.respawn(crossing(BLOCKS / 2, BLOCKS / 2));
     this.score = 0;
     this.wave = START_WAVE - 1;
+    this.streak = this.streakT = 0;
+    this.hitstopT = this.slowT = 0;
     this.waveTimer = -1;
     this.navTimer = 0;
     this.upgradeOffer = null;
@@ -274,8 +391,30 @@ export class Game {
     return o.add(d.scale(t));
   }
 
+  /** Freezes the action for a split second, to make a big hit land. */
+  hitstop(seconds: number) {
+    this.hitstopT = Math.max(this.hitstopT, seconds);
+  }
+
+  /** Slow motion for a while (a boss going down). */
+  slowmo(seconds: number) {
+    this.slowT = Math.max(this.slowT, seconds);
+  }
+
   private frame() {
-    const dt = Math.min(this.engine.getDeltaTime() / 1000, 0.05);
+    const real = Math.min(this.engine.getDeltaTime() / 1000, 0.05);
+    if (this.hitstopT > 0) {
+      this.hitstopT -= real;
+      this.timeScale = 0.04;
+    } else if (this.slowT > 0) {
+      this.slowT -= real;
+      this.timeScale = 0.28;
+    } else this.timeScale = Math.min(1, this.timeScale + real * 3);
+    const dt = real * this.timeScale;
+    this.scene.animationTimeScale = this.timeScale;
+    // Zoom in a little in slow motion.
+    const fov = this.slowT > 0 ? FOV * 0.82 : FOV;
+    this.camera.fov += (fov - this.camera.fov) * Math.min(1, real * 8);
     this.scene.animationsEnabled = this.state !== "paused";
     if (this.state === "playing") this.update(dt);
     else if (this.state !== "paused") {
@@ -292,14 +431,27 @@ export class Game {
       this.fx.update(dt);
       this.destruction.update(dt);
       this.crash?.update(dt);
+      this.scenery?.update(dt);
+      this.updateDaylight(dt);
       this.lightning.update(dt);
       this.weather.update(dt, this.camera.position, (dist) => this.sfx.thunder(dist));
       this.sky.setFlash(this.weather.flash);
       this.hemi.intensity = this.hemiBase + this.weather.flash * 1.4;
     }
+    this.streakT = Math.max(0, this.streakT - dt);
+    if (this.streakT === 0) this.streak = 0;
+    if (this.input.pressed("KeyM")) this.sfx.toggleMusic();
+    this.sfx.music(this.musicFor());
     this.hud.update(dt, this);
     this.input.endFrame();
     this.scene.render();
+  }
+
+  private musicFor() {
+    if (this.state === "won" || this.state === "dead" || this.state === "loading") return null;
+    if (this.state !== "playing") return "calm";
+    if (this.enemies.boss) return "boss";
+    return this.enemies.list.length ? BATTLE_TRACKS[Math.max(0, this.wave - 1) % BATTLE_TRACKS.length] : "calm";
   }
 
   private update(dt: number) {
@@ -323,6 +475,7 @@ export class Game {
       // The legs take the hit; the Moon's low gravity softens it.
       const k = Math.min(1, Math.max(0, (player.fell - FALL_SAFE) / (FALL_FATAL - FALL_SAFE))) * player.gravity;
       if (k > 0) this.hurtPlayer(k * FALL_MAX * player.maxHp, "fall");
+      if (k > 0.2 && player.alive) this.hud.callout("Яйцами пёзднулся");
       player.fell = 0;
     }
     this.sfx.jet(player.thrusting ? 1 : 0);
@@ -336,6 +489,8 @@ export class Game {
     }
     this.updateLaser(dt, aim);
     this.updateTesla(dt, aim);
+    this.updateBuster(dt, aim);
+    this.shawarma.update(dt, input.alt, player.chest().addInPlaceFromFloats(0, 0.8, 0), aim, this);
     const rocket = player.rockets(dt, input.down("KeyE"));
     if (rocket) {
       this.projectiles.rocket(rocket.from, rocket.dir, this);
@@ -396,6 +551,24 @@ export class Game {
   }
 
   /** Arcs to the enemy nearest the crosshair, then on to up to three more around it. */
+  /** The shawarma buster: shawarmas instead of bullets, from each gun in turn, a little harder than the machine guns. */
+  private updateBuster(dt: number, aim: Vector3) {
+    const p = this.player;
+    this.busterT -= dt;
+    if (p.special !== "shawarma" || !p.alive || !this.input.fire || this.busterT > 0) return;
+    const interval = BUSTER_INTERVAL * p.stats.fireInterval;
+    this.busterT = interval;
+    this.busterGun = 1 - this.busterGun;
+    const from = p.guns[this.busterGun].muzzlePosition();
+    let dir = aim.subtract(from).normalize();
+    if (Vector3.Dot(dir, p.look()) < 0.5) dir = p.look();
+    // Damage per second: the machine guns' times BUSTER_EDGE.
+    const damage = (p.stats.gunDamage / (FIRE_INTERVAL * p.stats.fireInterval)) * BUSTER_EDGE * interval;
+    this.shawarma.blast(from, dir, damage);
+    this.sfx.whoosh();
+    this.shake = Math.min(this.shake + 0.03, 0.15);
+  }
+
   private updateTesla(dt: number, aim: Vector3) {
     const p = this.player;
     const firing = p.special === "tesla" && p.alive && this.input.fire;
@@ -500,14 +673,15 @@ export class Game {
     // A cleared wave earns an upgrade: pick one of three with 1 / 2 / 3.
     if (this.wave > 0 && this.offeredFor < this.wave) {
       if (!this.upgradeOffer) {
-        this.upgradeOffer = offer(this.player.levels);
+        // A boss leaves a trophy: one of the big upgrades.
+        this.upgradeOffer = offer(this.player.levels, this.wave % BOSS_EVERY === 0);
         if (!this.upgradeOffer.length) {
           this.offeredFor = this.wave;
           this.upgradeOffer = null;
           return;
         }
         this.hud.showUpgrades(this.upgradeOffer, this.player.levels);
-        this.hud.banner(`Волна ${this.wave} пройдена`, 2);
+        this.hud.banner(this.wave % BOSS_EVERY === 0 ? "Трофей босса" : `Волна ${this.wave} пройдена`, 2);
       }
       const choice = ["1", "2", "3"].findIndex((n) => this.input.pressed(`Digit${n}`, `Numpad${n}`));
       const picked = this.upgradeOffer[choice];
@@ -530,7 +704,11 @@ export class Game {
     const boss = next === FINAL_WAVE ? "flagship" : next % BOSS_EVERY ? null : next === BOSS_EVERY ? "bossTitan" : "bossTitan2";
     if (this.waveTimer < 0) {
       this.waveTimer = boss ? 4 : 2.5;
-      this.hud.banner(boss === "flagship" ? "Финальная битва" : boss ? `Волна ${next} · Босс` : `Волна ${next}`, this.waveTimer);
+      // Every other wave the day turns to night, or night to day.
+      const day = isDay(next) ? 1 : 0;
+      const dusk = day !== this.dayTarget ? (day ? " · Рассвет" : " · Наступает ночь") : "";
+      this.dayTarget = day;
+      this.hud.banner((boss === "flagship" ? "Финальная битва" : boss ? `Волна ${next} · Босс` : `Волна ${next}`) + dusk, this.waveTimer);
       if (boss) this.sfx.bossAlarm();
     }
     this.waveTimer -= dt;
@@ -545,6 +723,10 @@ export class Game {
     }
   }
 
+  get multiplier() {
+    return Math.min(STREAK_MAX, 1 + Math.max(0, this.streak - 1) * STREAK_STEP);
+  }
+
   /** Camera shake that fades with distance from the player. */
   addShake(dist: number, amount: number) {
     this.shake = Math.min(1, this.shake + amount * Math.max(0, 1 - dist / 80));
@@ -553,10 +735,18 @@ export class Game {
   hurtPlayer(dmg: number, cause: "enemy" | "fall" = "enemy") {
     if (this.state !== "playing" || !this.player.alive) return;
     this.deathCause = cause;
-    this.player.hp = Math.max(0, this.player.hp - dmg);
-    this.hud.damage();
-    this.sfx.hurt();
-    this.shake = Math.min(1, this.shake + 0.3);
+    const hadShield = this.player.shield > 0;
+    const hull = this.player.takeHit(dmg, cause === "enemy");
+    if (hull > 0) {
+      this.hud.damage();
+      this.sfx.hurt();
+      this.shake = Math.min(1, this.shake + 0.3);
+    } else {
+      this.hud.shieldHit();
+      this.sfx.shieldHit();
+      this.shake = Math.min(1, this.shake + 0.1);
+    }
+    if (hadShield && this.player.shield <= 0) this.sfx.shieldDown();
     if (this.player.hp <= 0) this.die();
   }
 
@@ -578,7 +768,7 @@ export class Game {
     }, 1100);
     setTimeout(() => {
       const title = this.deathCause === "fall" ? "Едрить ты камикадзе" : "Робот уничтожен";
-      this.hud.showOverlay(title, `Счёт: ${this.score} · Волна: ${this.wave}<br>Кликни, чтобы сыграть ещё`);
+      this.hud.showOverlay(title, `${this.nick ? `${escapeHtml(this.nick)} · ` : ""}Счёт: ${this.score} · Волна: ${this.wave}<br>Кликни, чтобы сыграть ещё`, true);
     }, 2400);
   }
 
@@ -595,7 +785,7 @@ export class Game {
       for (const b of this.beams) b.hide();
       this.sfx.victory();
       document.exitPointerLock();
-      this.hud.showOverlay("Победа!", `Флагман сбит, Луна свободна.<br>Счёт: ${this.score}<br>Кликни, чтобы сыграть ещё`);
+      this.hud.showOverlay(this.nick ? `Победа, ${this.nick}!` : "Победа!", `Флагман сбит, Луна свободна.<br>Счёт: ${this.score}<br>Кликни, чтобы сыграть ещё`, true);
     }, 3500);
   }
 
@@ -603,10 +793,37 @@ export class Game {
     this.score += 200;
   }
 
+  /** A floating "+points" over a spot in the world. */
+  popup(at: Vector3, text: string, big = false) {
+    const w = this.engine.getRenderWidth(), h = this.engine.getRenderHeight();
+    const p = Vector3.Project(at, Matrix.Identity(), this.scene.getTransformMatrix(), this.camera.viewport.toGlobal(w, h));
+    if (p.z < 0 || p.z > 1) return;
+    const canvas = this.engine.getRenderingCanvas()!;
+    this.hud.popup((p.x / w) * canvas.clientWidth, (p.y / h) * canvas.clientHeight, text, big);
+  }
+
   onEnemyKilled(e: Enemy) {
-    this.score += e.spec.score;
+    // Streak: quick kills raise the multiplier; milestones get a callout.
+    this.streak = this.streakT > 0 ? this.streak + 1 : 1;
+    this.streakT = STREAK_WINDOW;
+    const mult = this.multiplier;
+    const points = Math.round(e.spec.score * mult);
+    this.score += points;
+    const top = this.enemies.centre(e).add(new Vector3(0, e.spec.hit[0][1] + 0.5, 0));
+    this.popup(top, mult > 1 ? `+${points} ×${mult}` : `+${points}`, e.spec.boss || points >= 500);
+    const callout = CALLOUTS[this.streak];
+    if (callout) {
+      this.hud.callout(callout);
+      this.sfx.callout(Object.keys(CALLOUTS).indexOf(String(this.streak)));
+    }
+    // Big kills land with a beat of hit-stop; bosses go down in slow motion.
+    if (e.spec.boss) this.slowmo(2.2);
+    else if (e.kind === "titan" || e.kind === "heavyDrone" || e.kind === "gunner") this.hitstop(0.08);
+
     const dist = Vector3.Distance(e.pos, this.player.pos);
-    if (e.spec.rig.death) this.fx.spark(e.pos.add(new Vector3(0, e.spec.hit[0][0], 0)), 30);
+    if (e.spec.kamikaze) {
+      // Its own blast is the explosion.
+    } else if (e.spec.rig.death) this.fx.spark(e.pos.add(new Vector3(0, e.spec.hit[0][0], 0)), 30);
     else {
       const size = e.spec.boss ? 4 : e.kind === "heavyDrone" ? 1.6 : 1;
       this.fx.explosion(e.pos, size);

@@ -13,6 +13,7 @@ import {
   Vector4,
 } from "@babylonjs/core";
 import { clamp, mat } from "./util";
+import type { Shape } from "./shapes";
 import { craterSpots, craters, lightsTexture, MOON_TINTS, moonBuilding, panelTexture } from "./moon";
 
 export type Theme = "earth" | "moon";
@@ -26,6 +27,8 @@ export interface Box {
   h: number;
   /** Set for buildings (trees have none): they can be stood on and knocked down. */
   building?: Building;
+  /** Its real outline, when the mesh doesn't fill the box (the Moon's round buildings). */
+  shape?: Shape;
 }
 
 export interface Building {
@@ -34,6 +37,7 @@ export interface Building {
   mesh: Mesh;
   earthMesh: Mesh;
   moonMesh: Mesh | null;
+  moonShape: Shape | null;
   tint: number;
   cx: number;
   cz: number;
@@ -220,8 +224,8 @@ export class City {
           mesh.material = this.materials[tint];
           this.finish(mesh, shadows);
           const box: Box = { minX: cx - w / 2, maxX: cx + w / 2, minZ: cz - d / 2, maxZ: cz + d / 2, h };
-          const maxHp = Math.round(40 + h * 2 + w * d * 0.05);
-          const building: Building = { box, mesh, earthMesh: mesh, moonMesh: null, tint, cx, cz, w, d, h, hp: maxHp, maxHp, standing: true, roofUnits: [] };
+          const maxHp = Math.round((40 + h * 2 + w * d * 0.05) * 1.25);
+          const building: Building = { box, mesh, earthMesh: mesh, moonMesh: null, moonShape: null, tint, cx, cz, w, d, h, hp: maxHp, maxHp, standing: true, roofUnits: [] };
           box.building = building;
           this.boxes.push(box);
           this.buildings.push(building);
@@ -323,16 +327,29 @@ export class City {
     let best = maxT, axis = 1, sign = 1;
     let box: Box | null = null;
     if (d.y < 0) best = Math.min(best, -o.y / d.y);
+    let shaped: Vector3 | null = null;
     for (const b of this.boxes) {
+      if (b.shape) {
+        // Only test the real outline if the ray gets into the box at all.
+        if (rayBox(o, d, b, best) >= best) continue;
+        const hit = b.shape.ray(o, d, best);
+        if (hit) {
+          best = hit.t;
+          box = b;
+          shaped = hit.normal;
+        }
+        continue;
+      }
       const t = rayBox(o, d, b, best);
       if (t < best) {
         best = t;
         box = b;
+        shaped = null;
         axis = hitAxis < 0 ? 1 : hitAxis;
         sign = hitAxis < 0 ? 1 : hitSign;
       }
     }
-    const normal = new Vector3(axis === 0 ? sign : 0, axis === 1 ? sign : 0, axis === 2 ? sign : 0);
+    const normal = shaped ?? new Vector3(axis === 0 ? sign : 0, axis === 1 ? sign : 0, axis === 2 ? sign : 0);
     return { t: best, normal, box };
   }
 
@@ -340,7 +357,13 @@ export class City {
   floorAt(x: number, z: number, r: number, y: number) {
     let floor = 0;
     for (const b of this.boxes) {
-      if (!b.building || b.h > y + 0.6 || b.h <= floor) continue;
+      if (!b.building) continue;
+      if (b.shape) {
+        const h = b.shape.heightAt(x, z);
+        if (h <= y + 0.6 && h > floor) floor = h;
+        continue;
+      }
+      if (b.h > y + 0.6 || b.h <= floor) continue;
       if (x > b.minX - r && x < b.maxX + r && z > b.minZ - r && z < b.maxZ + r) floor = b.h;
     }
     return floor;
@@ -368,6 +391,7 @@ export class City {
     for (const b of this.buildings) {
       b.mesh.setEnabled(false);
       b.mesh = moon ? b.moonMesh! : b.earthMesh;
+      b.box.shape = moon ? b.moonShape! : undefined;
       b.mesh.setEnabled(b.standing);
     }
     this.materials.forEach((m, i) => {
@@ -405,10 +429,11 @@ export class City {
     glass.alpha = 0.6;
     const metal = mat(scene, "stationMetal", "#5a5f67");
     this.buildings.forEach((b, i) => {
-      const m = moonBuilding(scene, b, glass, metal, i * 7 + 3);
-      this.finish(m, this.shadows);
-      m.setEnabled(false);
-      b.moonMesh = m;
+      const { mesh, shape } = moonBuilding(scene, b, glass, metal, i * 7 + 3);
+      this.finish(mesh, this.shadows);
+      mesh.setEnabled(false);
+      b.moonMesh = mesh;
+      b.moonShape = shape;
     });
     // Moon rocks where the park trees stood (on the same colliders).
     const rock = MeshBuilder.CreateIcoSphere("rock", { radius: 1.3, subdivisions: 1 }, scene);
@@ -460,6 +485,10 @@ export class City {
   /** Pushes a circle of radius r at p (on the XZ plane) out of buildings and keeps it inside the city. */
   collide(p: Vector3, r: number) {
     for (const b of this.boxes) {
+      if (b.shape) {
+        b.shape.push(p, r);
+        continue;
+      }
       if (p.y >= b.h - 0.01) continue; // above it, or standing on its roof
       const cx = clamp(p.x, b.minX, b.maxX);
       const cz = clamp(p.z, b.minZ, b.maxZ);
@@ -486,17 +515,22 @@ export class City {
 }
 
 /** Coarse grid over the city with a BFS distance field towards the player, used by drones to find a way around blocks. */
+/** The player, and four flanking points this far from them. */
+export const NAV_FIELDS = 5;
+const FLANK_DISTANCE = 40;
+
 export class NavGrid {
   readonly cell = 3;
   readonly n = Math.ceil(SIZE / 3);
   private blocked: Uint8Array;
-  private dist: Int32Array;
+  /** One distance field per target: the player, then flanking points around them. */
+  private fields: Int32Array[];
   private queue: Int32Array;
 
   constructor(boxes: Box[], private margin: number) {
     const n = this.n;
     this.blocked = new Uint8Array(n * n);
-    this.dist = new Int32Array(n * n).fill(-1);
+    this.fields = Array.from({ length: NAV_FIELDS }, () => new Int32Array(n * n).fill(-1));
     this.queue = new Int32Array(n * n);
     this.mark(0, n - 1, 0, n - 1, boxes);
   }
@@ -529,10 +563,37 @@ export class NavGrid {
     return !this.blocked[this.cellOf(x, z)];
   }
 
-  update(target: Vector3) {
-    const { n, dist, queue, blocked } = this;
+  /** The free cell nearest to (x, z), searching outwards ring by ring. */
+  private nearestFree(x: number, z: number) {
+    const c = this.cellOf(x, z);
+    if (!this.blocked[c]) return c;
+    const n = this.n, i0 = c % n, j0 = (c / n) | 0;
+    for (let r = 1; r < 12; r++) {
+      for (let dj = -r; dj <= r; dj++) {
+        for (let di = -r; di <= r; di++) {
+          if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+          const i = i0 + di, j = j0 + dj;
+          if (i < 0 || j < 0 || i >= n || j >= n) continue;
+          if (!this.blocked[j * n + i]) return j * n + i;
+        }
+      }
+    }
+    return c;
+  }
+
+  /**
+   * Rebuilds the distance fields: field 0 leads to the player, the others to points around
+   * them, so a pack chasing the player spreads over several streets and closes in from all sides.
+   */
+  update(player: Vector3) {
+    const r = FLANK_DISTANCE;
+    const targets = [player, ...[0, 1, 2, 3].map((k) => new Vector3(player.x + Math.cos((k * Math.PI) / 2) * r, 0, player.z + Math.sin((k * Math.PI) / 2) * r))];
+    targets.forEach((t, f) => this.fill(this.fields[f], f === 0 ? this.cellOf(t.x, t.z) : this.nearestFree(t.x, t.z)));
+  }
+
+  private fill(dist: Int32Array, start: number) {
+    const { n, queue, blocked } = this;
     dist.fill(-1);
-    const start = this.cellOf(target.x, target.z);
     let head = 0, tail = 0;
     dist[start] = 0;
     queue[tail++] = start;
@@ -552,9 +613,10 @@ export class NavGrid {
     }
   }
 
-  /** Unit direction on XZ towards the target along the distance field, or null if unreachable. */
-  steer(x: number, z: number) {
-    const { n, dist, blocked } = this;
+  /** Unit direction on XZ towards a target along its distance field, or null if unreachable. */
+  steer(x: number, z: number, field = 0) {
+    const { n, blocked } = this;
+    const dist = this.fields[field];
     const c = this.cellOf(x, z);
     const i = c % n, j = (c / n) | 0;
     let best = -1;

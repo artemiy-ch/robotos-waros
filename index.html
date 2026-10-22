@@ -13,10 +13,18 @@
       <div id="crosshair"></div>
       <div id="hitmarker"></div>
       <div id="damage"></div>
+      <div id="shield-hit"></div>
+      <div id="aura"></div>
       <div id="flash"></div>
       <div id="fade"></div>
       <div id="banner"></div>
       <div id="warning"></div>
+      <div id="callout"></div>
+      <div id="popups"></div>
+      <div id="combo" class="hidden">
+        <div id="combo-text"></div>
+        <div id="combo-bar"><div id="combo-fill"></div></div>
+      </div>
       <div id="boss" class="hidden">
         <div id="boss-name"></div>
         <div id="boss-bar"><div id="boss-fill"></div></div>
@@ -27,7 +35,12 @@
       </div>
       <div class="panel" id="health">
         <div class="row">
-          <span class="label">HP</span>
+          <span class="label">Щит</span>
+          <div class="bar"><div id="shield-fill"></div></div>
+          <b id="shield-text">60</b>
+        </div>
+        <div class="row">
+          <span class="label">Корпус</span>
           <div class="bar"><div id="hp-fill"></div></div>
           <b id="hp-text">100</b>
         </div>
@@ -42,12 +55,18 @@
           <b id="laser-text"></b>
         </div>
         <div class="row">
+          <span class="label">Удар</span>
+          <div class="bar"><div id="dive-fill"></div></div>
+          <kbd>Q</kbd>
+        </div>
+        <div class="row">
           <span class="label">Ракеты</span>
           <div class="bar"><div id="rocket-fill"></div></div>
           <kbd>E</kbd>
         </div>
       </div>
       <div class="panel" id="stats">
+        <div id="pilot-row" class="hidden"><span class="label">Пилот</span><b id="pilot-name"></b></div>
         <div><span class="label">Счёт</span><b id="score">0</b></div>
         <div><span class="label">Волна</span><b id="wave">0</b></div>
         <div><span class="label">Врагов</span><b id="left">0</b></div>
@@ -59,14 +78,24 @@
       <div class="card">
         <h1 id="ov-title">ROBOT WARS</h1>
         <p id="ov-text"></p>
+        <div id="pilot" class="hidden">
+          <input id="nick" type="text" maxlength="16" placeholder="Твой ник" autocomplete="off" spellcheck="false" />
+          <div class="skins">
+            <button type="button" class="skin" data-skin="dark"><i></i>Тёмный</button>
+            <button type="button" class="skin" data-skin="light"><i></i>Светлый</button>
+            <button type="button" class="skin" data-skin="rainbow"><i></i>Радуга</button>
+          </div>
+        </div>
         <ul class="controls">
           <li><kbd>W A S D</kbd> движение</li>
           <li><kbd>Shift</kbd> бег</li>
           <li><kbd>Пробел</kbd> полёт</li>
           <li><kbd>Q</kbd> в воздухе — удар о землю</li>
+          <li><kbd>M</kbd> музыка</li>
           <li><kbd>Мышь</kbd> прицел</li>
           <li><kbd>ЛКМ</kbd> пулемёты</li>
           <li><kbd>E</kbd> залп ракет</li>
+          <li><kbd>ПКМ</kbd> шаурмомёт</li>
           <li><kbd>Колесо</kbd> зум</li>
           <li><kbd>Esc</kbd> пауза</li>
         </ul>
@@ -75,7 +104,8 @@
           (<a href="https://creativecommons.org/licenses/by/3.0/" target="_blank" rel="noopener" onclick="event.stopPropagation()">CC BY 3.0</a>) ·
           роботы и пропсы — <a href="https://quaternius.com" target="_blank" rel="noopener" onclick="event.stopPropagation()">Quaternius</a>, <a href="https://quaternius.com" target="_blank" rel="noopener" onclick="event.stopPropagation()">Sci-Fi Essentials Kit</a> и
           <a href="https://opengameart.org/node/126992" target="_blank" rel="noopener" onclick="event.stopPropagation()">Animated Mech Pack</a> (CC0) ·
-          корабль — <a href="https://opengameart.org/content/lowpoly-spaceships-pack" target="_blank" rel="noopener" onclick="event.stopPropagation()">Quaternius, Ultimate Spaceships</a> (CC0)
+          корабль — <a href="https://opengameart.org/content/lowpoly-spaceships-pack" target="_blank" rel="noopener" onclick="event.stopPropagation()">Quaternius, Ultimate Spaceships</a> (CC0) ·
+          машины — <a href="https://www.patreon.com/rgsdev" target="_blank" rel="noopener" onclick="event.stopPropagation()">Rgsdev, Free Low Poly Vehicles Pack</a> (CC0)
         </p>
         <p class="credits legal">
           © 2026 Robot Wars. Некоммерческий проект. Копирование и распространение игры без разрешения автора запрещено.

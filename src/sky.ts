@@ -254,6 +254,13 @@ export class Sky {
     }
   }
 
+  /** Recolours the sky for the time of day: the horizon (and the haze over the planets) and the zenith. */
+  setColors(horizon: Color3, zenith: Color3) {
+    this.dome.setColor3("zenith", zenith);
+    this.dome.setColor3("horizon", horizon);
+    for (const b of this.bodies) b.setColor3("haze", horizon);
+  }
+
   /** Lightning lights up the whole sky for a moment; 0..1. */
   setFlash(flash: number) {
     this.dome.setFloat("flash", flash);
