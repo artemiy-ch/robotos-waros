@@ -59,8 +59,8 @@ export interface Spec {
   kamikaze?: { trigger: number; fuse: number; radius: number; dmg: number };
   /** The final boss: fights in phases and goes down in a long crash. */
   final?: boolean;
-  /** Launches this many drones every few seconds, up to a limit. */
-  launches?: { every: number; count: number; max: number };
+  /** Launches this many drones every few seconds, up to a limit; and kamikazes with them, up to their own limit. */
+  launches?: { every: number; count: number; max: number; kamikaze?: { count: number; max: number } };
 }
 
 export const SPECS: Record<Kind, Spec> = {
@@ -122,7 +122,7 @@ export const SPECS: Record<Kind, Spec> = {
     hit: [[0, 11, 0], [0, 11, 14], [0, 11, -14], [0, 9, 27], [0, 9, -27]],
     rig: { model: "Carrier", scale: 4, gait: null, death: null, attack: null, hit: null },
     boss: true, final: true, altitude: 80,
-    launches: { every: 6, count: 3, max: 12 },
+    launches: { every: 6, count: 3, max: 12, kamikaze: { count: 2, max: 6 } },
     rockets: { every: 5, count: 5, dmg: 26 },
   },
 };
@@ -560,6 +560,16 @@ export class Enemies {
       this.spawn("drone", e.pos.x + Math.cos(e.yaw) * side, e.pos.z - Math.sin(e.yaw) * side, e.pos.y - 5);
       g.fx.spark(new Vector3(e.pos.x, e.pos.y - 4, e.pos.z), 20);
     }
+    // Kamikazes drop out of the belly and dive at the player; one more each time once it is enraged.
+    const k = l.kamikaze;
+    if (!k) return;
+    const armed = this.list.filter((o) => o.kind === "kamikaze").length;
+    const count = Math.min(k.count + (e.stage >= 3 ? 1 : 0), k.max - armed);
+    for (let i = 0; i < count; i++) {
+      const along = (i - (count - 1) / 2) * 8;
+      this.spawn("kamikaze", e.pos.x + Math.sin(e.yaw) * along, e.pos.z + Math.cos(e.yaw) * along, e.pos.y - 8);
+    }
+    if (count > 0) g.hud.warning("Камикадзе!");
   }
 
   private mountGatling(e: Enemy) {
