@@ -184,6 +184,17 @@ export interface Enemy {
   /** Multiplayer: the player this stands in for, and their colour on the minimap. */
   pilot?: number;
   color?: string;
+  /** Multiplayer bots: its number across the room; shots fired and where at since last reported (host); who hit it last. */
+  netId?: number;
+  fired?: number;
+  aim?: Vector3;
+  by?: number;
+  /** A copy of the host's bot (not ours to run): its number, and where the host last saw it. */
+  remoteBot?: number;
+  netPos?: Vector3;
+  netYaw?: number;
+  /** Seconds the copy's gun keeps spinning after a reported shot. */
+  firingT?: number;
 }
 
 const DEATH_TIME = 1.1;
@@ -200,6 +211,7 @@ export class Enemies {
   private dying: { e: Enemy; t: number }[] = [];
   private tinted = new Map<string, PBRMaterial>();
 
+  private nextNet = 1;
   /** Ordinary enemies get tougher every wave, and tougher still on the Moon. */
   private hpScale = 1;
   private dmgScale = 1;
@@ -255,6 +267,7 @@ export class Enemies {
     mech.root.position.copyFrom(pos);
     const scaled = !spec.boss;
     this.list.push({
+      netId: this.nextNet++,
       kind, spec, mech, gatling, pos, hover,
       vel: Vector3.Zero(),
       yaw: Math.random() * Math.PI * 2,
@@ -305,14 +318,21 @@ export class Enemies {
   }
 
   update(dt: number, g: Game) {
-    const target = g.player.chest();
-    const canFire = g.state === "playing" && g.player.alive;
+    const local = { chest: g.player.chest(), vel: g.player.velocity, alive: g.state === "playing" && g.player.alive };
     for (const e of this.list) {
       if (e.pilot !== undefined) {
         e.flashT -= dt;
         e.mech.setFlash(e.flashT > 0);
         continue;
       }
+      if (e.remoteBot !== undefined) {
+        this.followBot(e, dt);
+        continue;
+      }
+      // In a room each robot goes for the nearest player; on its own, for ours.
+      const goal = g.arena ? g.arena.targetFor(e.pos) : local;
+      const target = goal.chest;
+      const canFire = goal.alive;
       const spec = e.spec;
       const flying = !spec.rig.gait;
       e.phase += dt;
@@ -381,7 +401,7 @@ export class Enemies {
           ? Math.max(2, target.y - 0.5)
           : spec.altitude
             ? e.hover
-            : Math.max(e.hover, Math.min(g.player.pos.y + e.hover * 0.6, 85));
+            : Math.max(e.hover, Math.min(target.y - 3.4 + e.hover * 0.6, 85));
         e.pos.y += (alt + Math.sin(e.phase * 1.7) * 0.4 - e.pos.y) * Math.min(1, dt * (spec.kamikaze ? 4 : 1.5));
       }
       if (spec.crusher) this.crush(e, dt, g);
@@ -435,7 +455,7 @@ export class Enemies {
       }
       e.burstT -= dt;
       if (e.burst > 0 && e.burstT <= 0) {
-        this.fire(e, target, g);
+        this.fire(e, target, g, goal.vel);
         e.burst--;
         e.burstT = 0.14;
       }
@@ -593,11 +613,14 @@ export class Enemies {
     e.gatling!.node.position.set(chest.x + c * lx + s * lz, chest.y + ly, chest.z - s * lx + c * lz);
   }
 
-  private fire(e: Enemy, chest: Vector3, g: Game) {
+  private fire(e: Enemy, chest: Vector3, g: Game, vel = g.player.velocity) {
     const spread = 0.04;
     // Aim where the player is going to be (about two thirds of the way).
     const lead = Vector3.Distance(e.pos, chest) / Math.max(1, e.spec.bulletSpeed);
-    const target = chest.add(g.player.velocity.scale(lead * 0.65));
+    const target = chest.add(vel.scale(lead * 0.65));
+    // Told to the other players, so their copies of this robot fire too.
+    e.fired = (e.fired ?? 0) + 1;
+    e.aim = target;
     const guns = e.spec.rig.guns;
     let from: Vector3;
     if (e.gatling) {
@@ -619,6 +642,15 @@ export class Enemies {
 
   /** `quiet` skips the hit click (the laser hits every frame). */
   damage(e: Enemy, dmg: number, g: Game, quiet = false) {
+    if (e.remoteBot !== undefined) {
+      // The host's robot: the host's game takes the damage.
+      if (dmg <= 0) return;
+      g.arena?.hitBot(e.remoteBot, dmg);
+      e.flashT = 0.08;
+      g.hud.hitMarker();
+      if (!quiet) g.sfx.hit();
+      return;
+    }
     if (e.pilot !== undefined) {
       // Only the shooter's own hits count (others' shots are just for show); the victim's game takes the damage.
       if (dmg <= 0) return;
@@ -770,6 +802,7 @@ export class Enemies {
   feed(e: Enemy, seconds: number, g: Game) {
     e.flashT = 0.15;
     if (e.pilot !== undefined) return g.arena?.stunPilot(e.pilot, seconds);
+    if (e.remoteBot !== undefined) return;
     if (e.spec.boss || seconds <= 0) return;
     if (e.stunT <= 0 && e.spec.kamikaze) e.fuse = -1; // forgets it was about to blow up, too
     e.stunT = seconds;
@@ -794,7 +827,7 @@ export class Enemies {
 
   /** A shove away from `from` (the landing shockwave). */
   knockBack(e: Enemy, from: Vector3, strength: number) {
-    if (e.pilot !== undefined) return;
+    if (e.pilot !== undefined || e.remoteBot !== undefined) return;
     const dx = e.pos.x - from.x, dz = e.pos.z - from.z;
     const d = Math.hypot(dx, dz) || 1;
     const k = e.spec.boss ? 0.15 : 1;
@@ -805,6 +838,76 @@ export class Enemies {
 
   get boss() {
     return this.list.find((e) => e.spec.boss) ?? null;
+  }
+
+  /** Multiplayer bots, which the host runs: these kinds (no bosses, nothing that homes in on one player). */
+  static readonly BOT_KINDS: Kind[] = ["drone", "drone", "walker", "gunner", "heavyDrone"];
+
+  /** The host adds a bot somewhere away from the action. */
+  spawnBot(g: Game) {
+    this.hpScale = 1.5;
+    this.dmgScale = 1;
+    this.spawnAwayFrom(g, Enemies.BOT_KINDS[Math.floor(Math.random() * Enemies.BOT_KINDS.length)]);
+  }
+
+  /** A copy of one of the host's bots. */
+  addRemoteBot(id: number, kind: Kind, x: number, y: number, z: number, yaw: number) {
+    this.spawn(kind, x, z, y);
+    const e = this.list[this.list.length - 1];
+    e.remoteBot = id;
+    e.netPos = new Vector3(x, y, z);
+    e.yaw = e.netYaw = yaw;
+    e.firingT = 0;
+    return e;
+  }
+
+  /** A copy whose bot is gone: blown up (or just removed, `quietly`). */
+  dropRemoteBot(e: Enemy, g: Game, quietly = false) {
+    const i = this.list.indexOf(e);
+    if (i >= 0) this.list.splice(i, 1);
+    if (!quietly) {
+      const dist = Vector3.Distance(e.pos, g.player.pos);
+      g.fx.explosion(e.pos.add(new Vector3(0, e.spec.hit[0][0] * 0.6, 0)), e.kind === "heavyDrone" ? 1.6 : 1.2);
+      g.sfx.explode(false, dist);
+    }
+    this.disposeEnemy(e);
+  }
+
+  /** A copy follows where the host says its bot is, walking or hovering as it goes. */
+  private followBot(e: Enemy, dt: number) {
+    const to = e.netPos!.subtract(e.pos);
+    const k = to.length() > 30 ? 1 : 1 - Math.exp(-dt * 10);
+    const step = to.scale(k);
+    e.pos.addInPlace(step);
+    const speed = Math.hypot(step.x, step.z) / Math.max(dt, 1e-3);
+    e.yaw = approachAngle(e.yaw, e.netYaw!, dt * 8);
+    e.phase += dt;
+    e.mech.root.position.copyFrom(e.pos);
+    e.mech.root.rotation.y = e.yaw;
+    const gait = e.spec.rig.gait;
+    if (gait && speed > 0.7) e.mech.anim.play(gait, { speed: speed / e.spec.speed });
+    else e.mech.anim.play("Idle");
+    e.mech.anim.update(dt);
+    e.firingT = Math.max(0, (e.firingT ?? 0) - dt);
+    if (e.gatling) {
+      this.mountGatling(e);
+      if (e.aim) e.gatling.aimAt(e.aim, e.yaw, 0.9);
+      e.gatling.update(dt, e.firingT > 0);
+    }
+    e.flashT -= dt;
+    e.mech.setFlash(e.flashT > 0);
+  }
+
+  /** A copy's shots, for show: the host's game deals the damage. */
+  showShots(e: Enemy, count: number, at: Vector3, g: Game) {
+    e.aim = at;
+    e.firingT = 0.4;
+    for (let i = 0; i < count; i++) {
+      const from = e.gatling ? e.gatling.muzzlePosition() : this.eye(e).add(at.subtract(e.pos).normalize().scale(e.spec.radius + 0.3));
+      const dir = at.subtract(from).normalize();
+      g.projectiles.spawn(from, dir.scale(e.spec.bulletSpeed), e.spec.shot, 0);
+    }
+    if (count) g.sfx.enemyShoot(Vector3.Distance(e.pos, g.player.pos), e.spec.shot === "plasma");
   }
 
   /** Another player's robot joins the list (multiplayer); its model belongs to the caller. */

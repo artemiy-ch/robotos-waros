@@ -1,6 +1,8 @@
 import { Color3, Matrix, Mesh, MeshBuilder, Quaternion, StandardMaterial, Vector3 } from "@babylonjs/core";
 import {
   BASES,
+  BOTS,
+  type BotState,
   BOOST_EVERY,
   COIN_POINTS,
   MAX_WIRES,
@@ -20,6 +22,7 @@ import {
   type PlayerInfo,
   type ServerMessage,
 } from "../shared/mp";
+import { Enemies, type Enemy, type Kind } from "./enemies";
 import type { Game } from "./game";
 import type { Net } from "./net";
 import { Player } from "./player";
@@ -37,6 +40,12 @@ const NEUTRAL = "#d9dde3";
 /** How close one has to come to pick up a coin or a tripwire kit, and how far off a tripwire can be set. */
 const GRAB_RADIUS = 3.4;
 const PLANT_REACH = 45;
+/** Bots: how many the host keeps going (more with more players), how often it adds one, how often it reports them. */
+const BOTS_BASE = 4;
+const BOTS_PER_PLAYER = 2;
+const BOTS_MAX = 12;
+const BOT_SPAWN_EVERY = 3;
+const BOT_SEND = 0.1;
 
 /** Another player in the room: their robot (for show, and a target in the enemy list) and its name tag. */
 interface Remote {
@@ -94,6 +103,14 @@ export class Arena {
   /** Our coins so far (each BOOST_EVERY of them is a boost), tripwires in hand, and how the next one goes up. */
   /** Seconds of the spawn guard left: no damage, no tripwires, until it runs out or we shoot. */
   guard = 0;
+  /** Who runs the bots; on the host, the next bot and report, where the bots head, and its timer. */
+  private host: number;
+  private botT = 2;
+  private botSendT = 0;
+  navTarget: Vector3 | null = null;
+  private navT = 0;
+  /** Hits on the host's bots since the last flush. */
+  private botHits = new Map<number, number>();
   private coinPoints = 0;
   private wires = 0;
   private vertical = false;
@@ -104,6 +121,7 @@ export class Arena {
     this.room = welcome.room;
     this.flags = welcome.flags;
     this.winner = welcome.winner;
+    this.host = welcome.host;
     this.ui = document.createElement("div");
     this.ui.id = "mp";
     document.body.classList.add("mp");
@@ -128,6 +146,10 @@ export class Arena {
     // Our robot's trim in our colour, so the others can tell us apart.
     paintHero(g.player.mech, g.skin, this.color);
     this.home(false, true);
+  }
+
+  get isHost() {
+    return this.host === this.me;
   }
 
   /** Our colour in this room. */
@@ -263,7 +285,9 @@ export class Arena {
         break;
       case "kill": {
         const { killer, victim } = msg;
-        this.log(killer === null ? `${this.colored(victim)} разбился` : `${this.colored(killer)} сбил ${this.colored(victim)}`);
+        this.log(
+          killer === BOTS ? `Боты сбили ${this.colored(victim)}` : killer === null ? `${this.colored(victim)} разбился` : `${this.colored(killer)} сбил ${this.colored(victim)}`,
+        );
         if (killer === this.me) {
           g.hud.callout(`Сбит: ${this.nick(victim)}`);
           g.sfx.callout(0);
@@ -288,6 +312,22 @@ export class Arena {
       case "taken":
         g.loot.open(msg.crate, msg.by === this.me, g);
         break;
+      case "host":
+        this.host = msg.id;
+        // Taking over the bots: the copies go, and ours will come.
+        if (this.isHost) for (const e of g.enemies.list.filter((x) => x.remoteBot !== undefined)) g.enemies.dropRemoteBot(e, g, true);
+        break;
+      case "bots":
+        if (!this.isHost) this.syncBots(msg.list);
+        break;
+      case "bothit": {
+        const e = g.enemies.list.find((x) => x.netId === msg.bot && x.remoteBot === undefined && x.pilot === undefined);
+        if (!e) break;
+        e.by = msg.from;
+        g.enemies.damage(e, msg.dmg, g, true);
+        e.by = undefined;
+        break;
+      }
       case "item":
         this.addItem(msg.item);
         break;
@@ -335,7 +375,7 @@ export class Arena {
     const by = this.lastHit && this.time - this.lastHit.t < KILL_CREDIT ? this.lastHit.id : null;
     this.net.send({ t: "died", by });
     this.respawnT = RESPAWN_TIME;
-    this.g.hud.banner(by !== null ? `Тебя сбил ${this.nick(by)}` : "Робот уничтожен", 2.5);
+    this.g.hud.banner(by === BOTS ? "Тебя сбили боты" : by !== null ? `Тебя сбил ${this.nick(by)}` : "Робот уничтожен", 2.5);
   }
 
   look(nick: string, skin: PlayerInfo["skin"]) {
@@ -367,7 +407,10 @@ export class Arena {
         },
       });
       this.net.flush();
+      for (const [bot, dmg] of this.botHits) this.net.send({ t: "bothit", bot, dmg: Math.round(dmg * 100) / 100 });
+      this.botHits.clear();
     }
+    if (this.isHost) this.runBots(dt);
     if (this.guard > 0) {
       const shooting = g.state === "playing" && (g.input.fire || g.input.alt || g.input.down("KeyE"));
       this.guard = shooting ? 0 : Math.max(0, this.guard - dt);
@@ -378,6 +421,105 @@ export class Arena {
     this.updateItems(dt);
     this.updateMines();
     this.updateUi();
+  }
+
+  // ---- Bots ----
+
+  /**
+   * The robot a bot at `pos` goes for: the nearest player still standing and not just back from
+   * the dead (us included). With nobody to fight it holds its fire.
+   */
+  targetFor(pos: Vector3) {
+    const g = this.g, p = g.player;
+    let best = { chest: p.chest(), vel: p.velocity, alive: p.alive && this.guard === 0 };
+    let bestD = best.alive ? Vector3.DistanceSquared(pos, best.chest) : Infinity;
+    for (const r of this.remotes.values()) {
+      const s = r.state;
+      if (!s || !s.al || s.pr) continue;
+      const chest = r.player.chest();
+      const d = Vector3.DistanceSquared(pos, chest);
+      if (d < bestD) {
+        bestD = d;
+        best = { chest, vel: new Vector3(s.vx, 0, s.vz), alive: true };
+      }
+    }
+    return best;
+  }
+
+  /** Another player in the way of a bot's shot (host only), or null. */
+  hitRemote(a: Vector3, b: Vector3) {
+    for (const r of this.remotes.values()) {
+      if (!r.state?.al || r.state.pr) continue;
+      if (r.player.hitSpheres().some(([c, rad]) => segSphere(a, b, c, rad))) return r.info.id;
+    }
+    return null;
+  }
+
+  /** A bot's shot hit us (we are the host): if it brings us down, the bots get the kill. */
+  hitByBot() {
+    this.lastHit = { id: BOTS, t: this.time };
+  }
+
+  /** A bot's shot hit another player (host only). */
+  botHurt(id: number, dmg: number) {
+    this.net.send({ t: "bothurt", to: id, dmg: Math.round(dmg * 100) / 100 });
+  }
+
+  /** Our shot hit one of the host's bots. */
+  hitBot(id: number, dmg: number) {
+    this.botHits.set(id, (this.botHits.get(id) ?? 0) + dmg);
+  }
+
+  /** A bot went down in our game (we are the host): whoever hit it last gets the points. */
+  botKilled(e: Enemy) {
+    this.net.send({ t: "botkill", killer: e.by ?? this.me });
+  }
+
+  /** The host keeps the bots coming, sends them roaming between the players, and tells everyone where they are. */
+  private runBots(dt: number) {
+    const g = this.g;
+    const bots = g.enemies.list.filter((e) => e.pilot === undefined && e.remoteBot === undefined);
+    const want = Math.min(BOTS_MAX, BOTS_BASE + BOTS_PER_PLAYER * this.infos.size);
+    this.botT -= dt;
+    if (bots.length < want && this.botT <= 0) {
+      this.botT = BOT_SPAWN_EVERY;
+      g.enemies.spawnBot(g);
+    }
+    // The street routes lead to one player at a time, a different one every few seconds.
+    this.navT -= dt;
+    if (this.navT <= 0) {
+      this.navT = 8;
+      const spots = [g.player.pos, ...[...this.remotes.values()].filter((r) => r.state?.al).map((r) => r.player.pos)];
+      this.navTarget = spots[Math.floor(Math.random() * spots.length)].clone();
+    }
+    this.botSendT -= dt;
+    if (this.botSendT > 0) return;
+    this.botSendT = BOT_SEND;
+    const r = (n: number) => Math.round(n * 10) / 10;
+    const list: BotState[] = bots.map((e) => {
+      const fired = e.fired ?? 0;
+      e.fired = 0;
+      const aim = e.aim ?? e.pos;
+      return [e.netId!, e.kind, r(e.pos.x), r(e.pos.y), r(e.pos.z), r(e.yaw), fired, r(aim.x), r(aim.y), r(aim.z)];
+    });
+    this.net.send({ t: "bots", list });
+  }
+
+  /** The host's report: copies come, move, fire and go to match it. */
+  private syncBots(list: BotState[]) {
+    const g = this.g;
+    const copies = new Map(g.enemies.list.filter((e) => e.remoteBot !== undefined).map((e) => [e.remoteBot!, e]));
+    const seen = new Set<number>();
+    for (const [id, kind, x, y, z, yaw, fired, ax, ay, az] of list) {
+      if (!Enemies.BOT_KINDS.includes(kind as Kind)) continue;
+      seen.add(id);
+      let e = copies.get(id);
+      if (!e) e = g.enemies.addRemoteBot(id, kind as Kind, x, y, z, yaw);
+      e.netPos!.set(x, y, z);
+      e.netYaw = yaw;
+      if (fired) g.enemies.showShots(e, fired, new Vector3(ax, ay, az), g);
+    }
+    for (const [id, e] of copies) if (!seen.has(id)) g.enemies.dropRemoteBot(e, g);
   }
 
   // ---- Coins and tripwire kits ----

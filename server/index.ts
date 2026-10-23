@@ -5,6 +5,8 @@ import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   BASES,
+  BOT_POINTS,
+  BOTS,
   CAPTURE_TIME,
   COIN_POINTS,
   COINS,
@@ -71,6 +73,8 @@ interface Room {
   mines: MineInfo[];
   nextItem: number;
   nextMine: number;
+  /** Whose game runs the bots: the longest in the room. */
+  host: number;
 }
 
 const rooms = new Map<string, Room>();
@@ -96,7 +100,7 @@ const freshFlags = (): FlagState[] => FLAGS.map(() => ({ owner: null, taker: nul
 function createRoom(): Room {
   const room: Room = {
     code: newCode(), clients: new Map(), flags: freshFlags(), crates: [], respawns: [], income: 0, winner: null, breakT: 0, nextId: 1, nextCrate: 1,
-    items: [], itemRespawns: [], mines: [], nextItem: 1, nextMine: 1,
+    items: [], itemRespawns: [], mines: [], nextItem: 1, nextMine: 1, host: 0,
   };
   for (let i = 0; i < CRATES; i++) addCrate(room, false);
   for (let i = 0; i < COINS; i++) addItem(room, "coin", false);
@@ -155,7 +159,8 @@ function join(ws: WebSocket, msg: Extract<ClientMessage, { t: "join" }>): [Room,
   const info: PlayerInfo = { id: room.nextId++, nick: msg.nick.slice(0, 16) || "Пилот", skin: msg.skin, color: COLORS[base], base, score: 0, kills: 0 };
   const client: Client = { ws, info, state: null, seen: 0 };
   room.clients.set(info.id, client);
-  send(ws, { t: "welcome", id: info.id, room: room.code, players: [...room.clients.values()].map((c) => c.info), flags: room.flags, crates: room.crates, items: room.items, mines: room.mines, winner: room.winner });
+  if (!room.clients.has(room.host)) room.host = info.id;
+  send(ws, { t: "welcome", host: room.host, id: info.id, room: room.code, players: [...room.clients.values()].map((c) => c.info), flags: room.flags, crates: room.crates, items: room.items, mines: room.mines, winner: room.winner });
   broadcast(room, { t: "joined", player: info }, info.id);
   console.log(`${room.code}: ${info.nick} joined (${room.clients.size})`);
   return [room, client];
@@ -172,7 +177,12 @@ function leave(room: Room, id: number) {
     if (f.taker === id) (f.taker = null), (f.progress = 0);
   }
   broadcast(room, { t: "left", id });
-  if (!room.clients.size) rooms.delete(room.code);
+  if (!room.clients.size) return void rooms.delete(room.code);
+  // The bots move to whoever has been in the room longest.
+  if (room.host === id) {
+    room.host = Math.min(...room.clients.keys());
+    broadcast(room, { t: "host", id: room.host });
+  }
 }
 
 function handle(room: Room, me: Client, msg: ClientMessage) {
@@ -193,6 +203,10 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
       break;
     }
     case "died": {
+      if (msg.by === BOTS) {
+        broadcast(room, { t: "kill", killer: BOTS, victim: id });
+        break;
+      }
       const killer = msg.by !== null && msg.by !== id ? room.clients.get(msg.by) : undefined;
       if (killer && room.winner === null) {
         killer.info.kills++;
@@ -239,6 +253,24 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
       if (i < 0) break;
       room.mines.splice(i, 1);
       broadcast(room, { t: "boom", mine: msg.mine, victim: id });
+      break;
+    }
+    case "bots":
+      if (id === room.host && Array.isArray(msg.list)) broadcast(room, { t: "bots", list: msg.list.slice(0, 40) }, id);
+      break;
+    case "bothit": {
+      const host = room.clients.get(room.host);
+      if (host && host !== me) send(host.ws, { t: "bothit", from: id, bot: msg.bot, dmg: Math.min(MAX_HIT, Math.max(0, msg.dmg)) });
+      break;
+    }
+    case "bothurt": {
+      const target = room.clients.get(msg.to);
+      if (id === room.host && target && target !== me) send(target.ws, { t: "hurt", from: BOTS, dmg: Math.min(MAX_HIT, Math.max(0, msg.dmg)) });
+      break;
+    }
+    case "botkill": {
+      const killer = room.clients.get(msg.killer);
+      if (id === room.host && killer && room.winner === null) killer.info.score += BOT_POINTS;
       break;
     }
     case "look":

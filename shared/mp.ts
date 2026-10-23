@@ -12,8 +12,11 @@ export const crossingXZ = (i: number, j: number): [number, number] => [-HALF + R
 
 export const MAX_PLAYERS = 4;
 /** Points to win: a held flag earns one a second, a kill earns KILL_POINTS. */
-export const TARGET_SCORE = 500;
+export const TARGET_SCORE = 1000;
 export const KILL_POINTS = 15;
+/** Points for bringing down a bot; and the "player" bots count as when they kill someone. */
+export const BOT_POINTS = 5;
+export const BOTS = -1;
 /** Seconds the winner is shown before the next round starts. */
 export const ROUND_BREAK = 12;
 /** Seconds dead before a player is back at their base. */
@@ -176,6 +179,9 @@ export interface MineInfo {
   b: [number, number, number];
 }
 
+/** One of the host's bots, as the others are told: [number, kind, x, y, z, yaw, shots since last time, aim x, y, z]. */
+export type BotState = [number, string, number, number, number, number, number, number, number, number];
+
 export type ClientMessage =
   | { t: "join"; room: string | null; nick: string; skin: Skin }
   | { t: "state"; s: PilotState }
@@ -187,10 +193,14 @@ export type ClientMessage =
   | { t: "grab"; item: number }
   | { t: "plant"; a: [number, number, number]; b: [number, number, number] }
   | { t: "trip"; mine: number }
+  | { t: "bots"; list: BotState[] }
+  | { t: "bothit"; bot: number; dmg: number }
+  | { t: "bothurt"; to: number; dmg: number }
+  | { t: "botkill"; killer: number }
   | { t: "look"; nick: string; skin: Skin };
 
 export type ServerMessage =
-  | { t: "welcome"; id: number; room: string; players: PlayerInfo[]; flags: FlagState[]; crates: CrateInfo[]; items: ItemInfo[]; mines: MineInfo[]; winner: number | null }
+  | { t: "welcome"; id: number; room: string; players: PlayerInfo[]; flags: FlagState[]; crates: CrateInfo[]; items: ItemInfo[]; mines: MineInfo[]; winner: number | null; host: number }
   | { t: "full" }
   | { t: "nope" }
   | { t: "joined"; player: PlayerInfo }
@@ -208,5 +218,8 @@ export type ServerMessage =
   | { t: "grabbed"; item: number; by: number; kind: ItemInfo["kind"] }
   | { t: "mine"; mine: MineInfo }
   | { t: "boom"; mine: number; victim: number | null }
+  | { t: "host"; id: number }
+  | { t: "bots"; list: BotState[] }
+  | { t: "bothit"; from: number; bot: number; dmg: number }
   | { t: "win"; id: number }
   | { t: "round" };

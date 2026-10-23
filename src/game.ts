@@ -769,7 +769,7 @@ export class Game {
   private updateWorld(dt: number) {
     this.navTimer -= dt;
     if (this.navTimer <= 0) {
-      this.city.nav.update(this.player.pos);
+      this.city.nav.update(this.arena?.navTarget ?? this.player.pos);
       this.navTimer = 0.3;
     }
     this.enemies.update(dt, this);
@@ -949,6 +949,16 @@ export class Game {
   }
 
   onEnemyKilled(e: Enemy) {
+    if (this.arena) {
+      // A bot in a room: the points go through the server; here just the bang.
+      this.arena.botKilled(e);
+      const dist = Vector3.Distance(e.pos, this.player.pos);
+      if (!e.spec.rig.death) {
+        this.fx.explosion(e.pos, e.kind === "heavyDrone" ? 1.6 : 1);
+        this.sfx.explode(false, dist);
+      }
+      return;
+    }
     // Streak: quick kills raise the multiplier; milestones get a callout.
     this.streak = this.streakT > 0 ? this.streak + 1 : 1;
     this.streakT = STREAK_WINDOW;

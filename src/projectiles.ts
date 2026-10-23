@@ -118,11 +118,20 @@ export class Projectiles {
       b.life -= dt;
       let dead = b.life <= 0;
 
-      if (!dead && b.kind !== "tracer" && g.player.alive) {
-        if (g.player.hitSpheres().some(([c, r]) => segSphere(prev, b.pos, c, r))) {
+      // Hostile fire with damage in it (copies of the host's bots fire blanks): us, or in a room another player.
+      if (!dead && b.kind !== "tracer" && b.dmg > 0) {
+        if (g.player.alive && g.player.hitSpheres().some(([c, r]) => segSphere(prev, b.pos, c, r))) {
           if (b.kind === "plasma") g.fx.pop(b.pos);
+          g.arena?.hitByBot();
           g.hurtPlayer(b.dmg);
           dead = true;
+        } else if (g.arena) {
+          const hit = g.arena.hitRemote(prev, b.pos);
+          if (hit !== null) {
+            if (b.kind === "plasma") g.fx.pop(b.pos);
+            g.arena.botHurt(hit, b.dmg);
+            dead = true;
+          }
         }
       }
       if (!dead && b.kind === "tracer") {
@@ -145,7 +154,7 @@ export class Projectiles {
             g.destruction.blast(at, 4, PLASMA_BUILDING_DAMAGE, g);
             g.props.blast(at, 4, g);
             const near = Vector3.Distance(at, g.player.chest());
-            if (near < 4) g.hurtPlayer(b.dmg * 0.5);
+            if (near < 4 && b.dmg > 0) g.hurtPlayer(b.dmg * 0.5);
           } else {
             g.fx.impact(at, hit.normal, b.kind === "tracer");
             if (b.kind === "tracer" && !g.props.hit(hit.box, b.dmg, g)) g.destruction.hit(hit.box, at, hit.normal, b.dmg, g);
