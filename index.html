@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex, nofollow" />
     <title>Robot Wars</title>
     <link rel="icon" href="data:," />
   </head>
@@ -79,6 +80,17 @@
         <h1 id="ov-title">ROBOT WARS</h1>
         <p id="ov-text"></p>
         <div id="pilot" class="hidden">
+          <div class="modes">
+            <button type="button" class="mode selected" data-mode="solo">Одиночная</button>
+            <button type="button" class="mode" data-mode="mp">Мультиплеер</button>
+          </div>
+          <div id="mp-menu" class="hidden">
+            <button type="button" id="mp-create" class="mp-button">Создать комнату</button>
+            <span class="mp-or">или</span>
+            <input id="mp-code" type="text" maxlength="4" placeholder="КОД" autocomplete="off" spellcheck="false" />
+            <button type="button" id="mp-join" class="mp-button">Войти</button>
+            <div id="mp-status"></div>
+          </div>
           <input id="nick" type="text" maxlength="16" placeholder="Твой ник" autocomplete="off" spellcheck="false" />
           <div class="skins">
             <button type="button" class="skin" data-skin="dark"><i></i>Тёмный</button>

@@ -6,7 +6,7 @@ import type { ShotKind } from "./projectiles";
 import { approachAngle, clamp, raySphere, segSphere } from "./util";
 import { Gatling } from "./weapons";
 
-export type Kind = "drone" | "kamikaze" | "heavyDrone" | "walker" | "gunner" | "titan" | "bossTitan" | "bossTitan2" | "carrier" | "flagship";
+export type Kind = "drone" | "kamikaze" | "heavyDrone" | "walker" | "gunner" | "titan" | "bossTitan" | "bossTitan2" | "carrier" | "flagship" | "pilot";
 
 interface RigSpec {
   model: RigName;
@@ -64,6 +64,12 @@ export interface Spec {
 }
 
 export const SPECS: Record<Kind, Spec> = {
+  // Another player in multiplayer: moved by the network, hit like a robot, damaged over the network.
+  pilot: {
+    name: "Пилот", hp: 100, speed: 0, radius: 1.3, score: 0, drop: 0, want: 0, range: 0,
+    dmg: 0, bulletSpeed: 1, burst: 0, cooldown: [9, 9], shot: "tracer", hit: [[3.4, 1.6], [1.4, 1.1]],
+    rig: { model: "Hero", scale: 0.42, gait: null, death: null, attack: null, hit: null },
+  },
   drone: {
     name: "Дрон", hp: 4, speed: 10, radius: 1.1, score: 100, drop: 0.15, want: 16, range: 60,
     dmg: 6, bulletSpeed: 34, burst: 1, cooldown: [1.2, 2.5], shot: "bolt", hit: [[0, 1.15]],
@@ -175,6 +181,9 @@ export interface Enemy {
   salvo: number;
   salvoT: number;
   rocketT: number;
+  /** Multiplayer: the player this stands in for, and their colour on the minimap. */
+  pilot?: number;
+  color?: string;
 }
 
 const DEATH_TIME = 1.1;
@@ -299,6 +308,11 @@ export class Enemies {
     const target = g.player.chest();
     const canFire = g.state === "playing" && g.player.alive;
     for (const e of this.list) {
+      if (e.pilot !== undefined) {
+        e.flashT -= dt;
+        e.mech.setFlash(e.flashT > 0);
+        continue;
+      }
       const spec = e.spec;
       const flying = !spec.rig.gait;
       e.phase += dt;
@@ -605,6 +619,15 @@ export class Enemies {
 
   /** `quiet` skips the hit click (the laser hits every frame). */
   damage(e: Enemy, dmg: number, g: Game, quiet = false) {
+    if (e.pilot !== undefined) {
+      // Only the shooter's own hits count (others' shots are just for show); the victim's game takes the damage.
+      if (dmg <= 0) return;
+      g.arena?.hitPilot(e.pilot, dmg);
+      e.flashT = 0.08;
+      g.hud.hitMarker();
+      if (!quiet) g.sfx.hit();
+      return;
+    }
     if (e.hp <= 0) return;
     e.hp -= dmg;
     e.flashT = 0.08;
@@ -744,8 +767,9 @@ export class Enemies {
   }
 
   /** Hit by a shawarma: everything but a boss stops to spin round in a daze. */
-  feed(e: Enemy, seconds: number) {
+  feed(e: Enemy, seconds: number, g: Game) {
     e.flashT = 0.15;
+    if (e.pilot !== undefined) return g.arena?.stunPilot(e.pilot, seconds);
     if (e.spec.boss || seconds <= 0) return;
     if (e.stunT <= 0 && e.spec.kamikaze) e.fuse = -1; // forgets it was about to blow up, too
     e.stunT = seconds;
@@ -770,6 +794,7 @@ export class Enemies {
 
   /** A shove away from `from` (the landing shockwave). */
   knockBack(e: Enemy, from: Vector3, strength: number) {
+    if (e.pilot !== undefined) return;
     const dx = e.pos.x - from.x, dz = e.pos.z - from.z;
     const d = Math.hypot(dx, dz) || 1;
     const k = e.spec.boss ? 0.15 : 1;
@@ -782,10 +807,26 @@ export class Enemies {
     return this.list.find((e) => e.spec.boss) ?? null;
   }
 
+  /** Another player's robot joins the list (multiplayer); its model belongs to the caller. */
+  addPilot(id: number, mech: Mech, pos: Vector3, color: string) {
+    const spec = SPECS.pilot;
+    this.list.push({
+      kind: "pilot", spec, mech, gatling: null, pos, hover: 0, vel: Vector3.Zero(), yaw: 0, hp: spec.hp, dmgScale: 1, flank: 0,
+      fuse: -1, beepT: 0, phase: 0, strafe: 1, fireCd: 99, burst: 0, burstT: 0, flashT: 0, gun: 0, hitAnimT: 0, stunT: 0,
+      crushT: 0, stompT: 0, launchT: 99, stage: 1, salvo: 0, salvoT: 0, rocketT: 0, pilot: id, color,
+    });
+  }
+
+  removePilot(id: number) {
+    const i = this.list.findIndex((e) => e.pilot === id);
+    if (i >= 0) this.list.splice(i, 1);
+  }
+
+  /** Every robot goes, except other players' (they leave when their players do). */
   clear() {
-    for (const e of this.list) this.disposeEnemy(e);
+    for (const e of this.list) if (e.pilot === undefined) this.disposeEnemy(e);
     for (const d of this.dying) this.disposeEnemy(d.e);
-    this.list.length = 0;
+    this.list.splice(0, this.list.length, ...this.list.filter((e) => e.pilot !== undefined));
     this.dying.length = 0;
   }
 }

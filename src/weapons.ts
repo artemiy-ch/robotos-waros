@@ -120,6 +120,10 @@ export class LaserBeam {
     this.glow.setEnabled(false);
     this.tip.setEnabled(false);
   }
+
+  dispose() {
+    for (const m of [this.core, this.glow, this.tip]) m.dispose(false, true);
+  }
 }
 
 /** Tesla bolts: jagged arcs that crackle for a blink and are gone. */

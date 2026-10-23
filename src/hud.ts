@@ -76,8 +76,44 @@ export class Hud {
     }
   }
 
-  onOverlayClick(fn: () => void) {
+  onOverlayClick(fn: (e: MouseEvent) => void) {
     this.overlay.addEventListener("click", fn);
+  }
+
+  overlayText(html: string) {
+    this.ovText.innerHTML = html;
+  }
+
+  private modeButtons: HTMLButtonElement[] = [];
+  private onMode: (mode: "solo" | "mp") => void = () => {};
+
+  /** The single-player / multiplayer switch on the start screen, and the room controls. */
+  setupModes(h: { mode(mode: "solo" | "mp"): void; create(): void; join(code: string): void }) {
+    this.onMode = h.mode;
+    this.modeButtons = [...this.pilot.querySelectorAll<HTMLButtonElement>(".mode")];
+    for (const b of this.modeButtons) b.addEventListener("click", () => this.pickMode(b.dataset.mode as "solo" | "mp"));
+    const code = byId<HTMLInputElement>("mp-code");
+    const join = () => {
+      if (code.value.length === 4) h.join(code.value);
+      else this.mpStatus("Код — четыре буквы");
+    };
+    byId("mp-create").addEventListener("click", () => h.create());
+    byId("mp-join").addEventListener("click", join);
+    code.addEventListener("input", () => (code.value = code.value.toUpperCase().replace(/[^A-Z]/g, "")));
+    code.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") join();
+    });
+  }
+
+  pickMode(mode: "solo" | "mp", code?: string) {
+    for (const b of this.modeButtons) b.classList.toggle("selected", b.dataset.mode === mode);
+    byId("mp-menu").classList.toggle("hidden", mode !== "mp");
+    if (code) byId<HTMLInputElement>("mp-code").value = code.toUpperCase();
+    this.onMode(mode);
+  }
+
+  mpStatus(text: string) {
+    byId("mp-status").textContent = text;
   }
 
   /** The start/end screen; `pilot` also shows the nickname and skin picker. */
@@ -268,20 +304,23 @@ export class Hud {
     if (this.mapVersion !== this.city.version) this.drawMapBackground();
     c.drawImage(this.mapBg, 0, 0);
 
+    // In a room the crates and repair kits aren't on the map: finding them is part of it.
     c.fillStyle = "#ffb020";
-    for (const k of g.loot.crates) {
+    for (const k of g.arena ? [] : g.loot.crates) {
       if (k.opened >= 0) continue;
       c.fillStyle = "#ffd21a";
       c.fillRect(px(k.pos.x) - 3, pz(k.pos.z) - 3, 6, 6);
     }
 
+    g.arena?.drawMap(c, px, pz);
+
     c.fillStyle = "#4be37a";
-    for (const k of g.pickups.list) c.fillRect(px(k.root.position.x) - 2, pz(k.root.position.z) - 2, 4, 4);
+    for (const k of g.arena ? [] : g.pickups.list) c.fillRect(px(k.root.position.x) - 2, pz(k.root.position.z) - 2, 4, 4);
 
     for (const e of g.enemies.list) {
-      c.fillStyle = "#ff3b3b";
+      c.fillStyle = e.color ?? "#ff3b3b";
       c.beginPath();
-      c.arc(px(e.pos.x), pz(e.pos.z), e.spec.boss ? 7 : e.kind === "titan" || e.kind === "heavyDrone" ? 4 : 2.5, 0, Math.PI * 2);
+      c.arc(px(e.pos.x), pz(e.pos.z), e.spec.boss ? 7 : e.pilot !== undefined || e.kind === "titan" || e.kind === "heavyDrone" ? 4 : 2.5, 0, Math.PI * 2);
       c.fill();
     }
 

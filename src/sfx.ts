@@ -184,6 +184,17 @@ export class Sfx {
     osc.stop(t + dur + 0.05);
   }
 
+  /** A coin picked up: a bright two-note chime. */
+  coin() {
+    this.tone(988, 1318, 0.08, "square", 0.07);
+    setTimeout(() => this.tone(1318, 1760, 0.12, "square", 0.06), 70);
+  }
+
+  /** A tripwire clicking into place. */
+  click() {
+    this.tone(700, 300, 0.06, "square", 0.07);
+  }
+
   /** A shawarma leaving the launcher. */
   whoosh() {
     this.burst(0.16, 900, "bandpass", 0.18);

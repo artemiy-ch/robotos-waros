@@ -1,0 +1,18 @@
+# The multiplayer server (server/) on Fly.io. Deploy from the repo root: fly deploy --ha=false
+# One machine only: the rooms live in its memory. It sleeps when nobody is connected and wakes on the next visit.
+app = "robot-wars-mp"
+primary_region = "fra"
+
+[build]
+  dockerfile = "server/Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

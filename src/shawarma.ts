@@ -86,10 +86,15 @@ export class Shawarma {
     this.cooldown -= dt;
     if (held && this.cooldown <= 0) {
       this.cooldown = COOLDOWN;
-      this.launch(from, aim.subtract(from).normalize(), LOB, LOB.damage);
+      this.lob(from, aim, LOB.damage);
       g.sfx.whoosh();
     }
     for (const w of [...this.wraps]) this.fly(w, dt, g);
+  }
+
+  /** One lobbed shawarma; with no damage it is only for show (another player's throw). */
+  lob(from: Vector3, aim: Vector3, damage = LOB.damage) {
+    this.launch(from, aim.subtract(from).normalize(), LOB, damage);
   }
 
   /** One shot of the shawarma buster, straight along `dir`. */
@@ -119,7 +124,8 @@ export class Shawarma {
     const enemy = g.enemies.hitTest(prev, end);
     if (enemy) {
       w.pos.copyFrom(end);
-      g.enemies.feed(enemy, w.kind.stun);
+      if (w.damage <= 0) return this.drop(w, g);
+      g.enemies.feed(enemy, w.kind.stun, g);
       g.enemies.damage(enemy, w.damage, g, true);
       if (Math.random() < w.kind.shout) {
         g.popup(w.pos, SHOUTS[Math.floor(Math.random() * SHOUTS.length)], true);

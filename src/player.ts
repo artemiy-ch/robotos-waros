@@ -78,6 +78,8 @@ export class Player {
   private apex = 0;
   /** Counts footfalls; alternates the step sound between the feet. */
   steps = 0;
+  /** Seconds left of standing dazed, fed a shawarma by another player. */
+  stunT = 0;
 
   readonly mech: Mech;
   private rig: HeroRig;
@@ -99,7 +101,8 @@ export class Player {
   private salvo = 0;
   private salvoT = 0;
 
-  constructor(models: Models, scene: Scene, shadows: ShadowGenerator, fx: Fx) {
+  /** `remote`: another player's robot, which goes without the muzzle light (materials only take a few lights). */
+  constructor(models: Models, scene: Scene, shadows: ShadowGenerator, fx: Fx, remote = false) {
     this.mech = models.spawn("Hero", HERO_SCALE);
     this.rig = new HeroRig(this.mech);
     this.nozzles = armour(this.mech, scene, shadows);
@@ -110,6 +113,7 @@ export class Player {
     this.light.specular = Color3.Black();
     this.light.range = 16;
     this.light.intensity = 0;
+    this.light.setEnabled(!remote);
     // Leg jets, then the two jet-pack nozzles.
     this.jets = [fx.jet(), fx.jet(), fx.jet(), fx.jet()];
   }
@@ -164,14 +168,17 @@ export class Player {
     return new Vector3(Math.sin(this.yaw) * cp, -Math.sin(this.pitch), Math.cos(this.yaw) * cp);
   }
 
-  respawn(at: Vector3) {
+  /** Back in one piece at `at`; `keep` holds on to the upgrades (multiplayer, where dying goes on all round). */
+  respawn(at: Vector3, keep = false) {
     this.pos.copyFrom(at);
     this.vel.setAll(0);
     this.vy = 0;
     this.apex = at.y;
     this.fell = this.landed = 0;
-    this.stats = baseStats();
-    this.levels.clear();
+    if (!keep) {
+      this.stats = baseStats();
+      this.levels.clear();
+    }
     this.hp = this.maxHp;
     this.shield = this.maxShield;
     this.sinceHit = 99;
@@ -185,6 +192,7 @@ export class Player {
     this.deathT = -1;
     this.diveCd = 0;
     this.diving = false;
+    this.stunT = 0;
     this.mech.root.setEnabled(true);
     for (const g of this.guns) g.setEnabled(true);
     this.mech.root.position.copyFrom(this.pos);
@@ -230,7 +238,8 @@ export class Player {
     this.camDist = clamp(this.camDist + look.wheel * 0.01, 6, 22);
 
     let mx = 0, mz = 0;
-    if (this.alive) {
+    this.stunT = Math.max(0, this.stunT - dt);
+    if (this.alive && this.stunT === 0) {
       const fx = Math.sin(this.yaw), fz = Math.cos(this.yaw);
       const ahead = (input.down("KeyW") ? 1 : 0) - (input.down("KeyS") ? 1 : 0);
       const side = (input.down("KeyD") ? 1 : 0) - (input.down("KeyA") ? 1 : 0);
@@ -262,7 +271,7 @@ export class Player {
     }
     if (this.diving) this.vy = Math.min(this.vy, -DIVE_SPEED);
     // Space fires the leg jets: hold to climb, tap to hover, release to drop.
-    const wantThrust = this.alive && input.down("Space") && !this.diving;
+    const wantThrust = this.alive && input.down("Space") && !this.diving && this.stunT === 0;
     this.thrusting = wantThrust && this.fuel > (this.thrusting ? 0 : 0.08);
     if (this.thrusting) {
       this.vy = Math.min(MAX_RISE, this.vy + THRUST * dt);
@@ -350,7 +359,7 @@ export class Player {
   /** Alternates the two cannons while the trigger is held. */
   fire(dt: number, trigger: boolean): Shot | null {
     this.cooldown -= dt;
-    if (!trigger || !this.alive || this.cooldown > 0 || this.special) return null;
+    if (!trigger || !this.alive || this.cooldown > 0 || this.special || this.stunT > 0) return null;
     this.cooldown = FIRE_INTERVAL * this.stats.fireInterval;
     this.gun = 1 - this.gun;
     const g = this.guns[this.gun];
@@ -366,7 +375,7 @@ export class Player {
   /** A salvo of rockets from the tops of the cannon pods, then a cooldown. */
   rockets(dt: number, trigger: boolean): Shot | null {
     this.rocketCd = Math.max(0, this.rocketCd - dt);
-    if (trigger && this.alive && this.rocketCd === 0) {
+    if (trigger && this.alive && this.rocketCd === 0 && this.stunT === 0) {
       this.salvo = this.stats.salvo;
       this.salvoT = 0;
       this.rocketCd = this.stats.rocketCooldown;
@@ -380,6 +389,31 @@ export class Player {
     const from = g.muzzlePosition().addInPlaceFromFloats(0, 0.6, 0);
     const dir = g.direction().addInPlaceFromFloats((Math.random() - 0.5) * 0.06, 0.03, (Math.random() - 0.5) * 0.06).normalize();
     return { from, dir, right: g.right() };
+  }
+
+  /**
+   * Another player's robot: moved to where the network says it is (smoothed between updates)
+   * rather than by input. Its weapons are then posed and fired as usual, for show.
+   */
+  follow(dt: number, s: { x: number; y: number; z: number; yaw: number; pitch: number; vx: number; vz: number; g: boolean; th: boolean; sp: Special | null }) {
+    const k = 1 - Math.exp(-dt * 14);
+    const far = Math.hypot(s.x - this.pos.x, s.y - this.pos.y, s.z - this.pos.z) > 25;
+    if (far) this.pos.set(s.x, s.y, s.z);
+    else this.pos.addInPlaceFromFloats((s.x - this.pos.x) * k, (s.y - this.pos.y) * k, (s.z - this.pos.z) * k);
+    this.vel.set(s.vx, 0, s.vz);
+    this.onGround = s.g;
+    this.thrusting = s.th && this.alive;
+    this.yaw = s.yaw;
+    this.pitch = s.pitch;
+    this.special = s.sp;
+    if (this.alive) this.facing = approachAngle(this.facing, s.yaw, dt * 12);
+  }
+
+  dispose() {
+    this.mech.dispose();
+    for (const g of this.guns) g.dispose();
+    this.light.dispose();
+    for (const j of this.jets) j.dispose();
   }
 
   /** Over-the-shoulder camera that slides in instead of clipping into walls. */

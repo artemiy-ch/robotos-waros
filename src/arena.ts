@@ -1,0 +1,787 @@
+import { Color3, Matrix, Mesh, MeshBuilder, Quaternion, StandardMaterial, Vector3 } from "@babylonjs/core";
+import {
+  BASES,
+  BOOST_EVERY,
+  COIN_POINTS,
+  MAX_WIRES,
+  MINE_ARM,
+  MINE_DAMAGE,
+  streetSpot,
+  WIRE_LENGTH,
+  type ItemInfo,
+  type MineInfo,
+  SPAWN_GUARD,
+  inZone,
+  FLAGS,
+  RESPAWN_TIME,
+  TARGET_SCORE,
+  type FlagState,
+  type PilotState,
+  type PlayerInfo,
+  type ServerMessage,
+} from "../shared/mp";
+import type { Game } from "./game";
+import type { Net } from "./net";
+import { Player } from "./player";
+import { paintHero } from "./skins";
+import { segSphere } from "./util";
+import { LaserBeam } from "./weapons";
+
+/** How often our robot's state goes out (and saved-up hits with it). */
+const SEND_INTERVAL = 0.05;
+/** A death within this many seconds of being hit is that player's kill. */
+const KILL_CREDIT = 8;
+const BULLET_SPEED = 170;
+const LASER_RANGE = 220;
+const NEUTRAL = "#d9dde3";
+/** How close one has to come to pick up a coin or a tripwire kit, and how far off a tripwire can be set. */
+const GRAB_RADIUS = 3.4;
+const PLANT_REACH = 45;
+
+/** Another player in the room: their robot (for show, and a target in the enemy list) and its name tag. */
+interface Remote {
+  info: PlayerInfo;
+  player: Player;
+  state: PilotState | null;
+  tag: HTMLElement;
+  hpBar: HTMLElement;
+  beams: LaserBeam[] | null;
+  /** Timers for the show copies of their tesla zaps, buster shots and lobbed shawarmas. */
+  zapT: number;
+  blastT: number;
+  lobT: number;
+  gun: number;
+}
+
+/** A flag in its zone: pole, cloth in the owner's colour, a ring round the zone, and a ring that fills as it is taken. */
+interface FlagView {
+  cloth: StandardMaterial;
+  ring: StandardMaterial;
+  progress: Mesh;
+  progressMat: StandardMaterial;
+  clothMesh: Mesh;
+}
+
+/**
+ * Multiplayer: up to four players fighting over five flags across the city. This keeps the other
+ * players' robots in step with the server, shows the flags and the score, and tells the server
+ * what our robot does, whom it hits and who brought it down.
+ */
+export class Arena {
+  readonly me: number;
+  readonly room: string;
+  private infos = new Map<number, PlayerInfo>();
+  private remotes = new Map<number, Remote>();
+  private flags: FlagState[];
+  private views: FlagView[] = [];
+  private flagMeshes: Mesh[] = [];
+  winner: number | null;
+  private sendT = 0;
+  private lastHit: { id: number; t: number } | null = null;
+  private time = 0;
+  private respawnT = -1;
+  private ui: HTMLElement;
+  private board: HTMLElement;
+  private flagBar: HTMLElement;
+  private capture: HTMLElement;
+  private feed: HTMLElement;
+  private items = new Map<number, { info: ItemInfo; mesh: Mesh; asked: number }>();
+  /** Tripwires, with when each was set (it goes live MINE_ARM seconds later). */
+  private mines = new Map<number, { info: MineInfo; meshes: Mesh[]; asked: boolean; born: number }>();
+  private itemBases: Record<ItemInfo["kind"], Mesh>;
+  private wireMat: StandardMaterial;
+  private ownWireMat: StandardMaterial;
+  /** Our coins so far (each BOOST_EVERY of them is a boost), tripwires in hand, and how the next one goes up. */
+  /** Seconds of the spawn guard left: no damage, no tripwires, until it runs out or we shoot. */
+  guard = 0;
+  private coinPoints = 0;
+  private wires = 0;
+  private vertical = false;
+  private preview: Mesh;
+
+  constructor(private g: Game, private net: Net, welcome: Extract<ServerMessage, { t: "welcome" }>) {
+    this.me = welcome.id;
+    this.room = welcome.room;
+    this.flags = welcome.flags;
+    this.winner = welcome.winner;
+    this.ui = document.createElement("div");
+    this.ui.id = "mp";
+    document.body.classList.add("mp");
+    this.ui.innerHTML = `<div id="mp-flags"></div><div id="mp-board"></div><div id="mp-capture"></div><div id="mp-feed"></div>`;
+    document.getElementById("hud")!.append(this.ui);
+    this.flagBar = this.ui.querySelector("#mp-flags")!;
+    this.board = this.ui.querySelector("#mp-board")!;
+    this.capture = this.ui.querySelector("#mp-capture")!;
+    this.feed = this.ui.querySelector("#mp-feed")!;
+    this.buildFlags();
+    this.itemBases = this.buildItems();
+    this.wireMat = this.glow("wire", "#ff3030", 0.55);
+    this.ownWireMat = this.glow("ownWire", "#ff5a5a", 0.95);
+    this.preview = MeshBuilder.CreateCylinder("wirePreview", { diameter: 0.12, height: 1, tessellation: 6 }, g.scene);
+    this.preview.material = this.glow("wirePreview", "#ffffff", 0.35);
+    this.preview.isPickable = false;
+    this.preview.setEnabled(false);
+    for (const p of welcome.players) this.addPlayer(p);
+    for (const c of welcome.crates) g.loot.add(c);
+    for (const it of welcome.items) this.addItem(it);
+    for (const m of welcome.mines) this.addMine(m);
+    // Our robot's trim in our colour, so the others can tell us apart.
+    paintHero(g.player.mech, g.skin, this.color);
+    this.home(false, true);
+  }
+
+  /** Our colour in this room. */
+  get color() {
+    return this.mine.color;
+  }
+
+  private glow(name: string, hex: string, alpha: number) {
+    const m = new StandardMaterial(name, this.g.scene);
+    m.diffuseColor = Color3.Black();
+    m.emissiveColor = Color3.FromHexString(hex);
+    m.disableLighting = true;
+    m.alpha = alpha;
+    return m;
+  }
+
+  private get mine() {
+    return this.infos.get(this.me)!;
+  }
+
+  // ---- Players ----
+
+  private addPlayer(info: PlayerInfo) {
+    this.infos.set(info.id, info);
+    if (info.id === this.me) return;
+    const g = this.g;
+    const player = new Player(g.models, g.scene, g.shadows, g.fx, true);
+    // Its own copies of the hero's paint, so its skin doesn't repaint everyone else.
+    for (const m of player.mech.meshes) if (m.material) m.material = m.material.clone(m.material.name);
+    paintHero(player.mech, info.skin, info.color);
+    const [x, z] = BASES[info.base];
+    player.respawn(new Vector3(x, 0, z));
+    g.enemies.addPilot(info.id, player.mech, player.pos, info.color);
+    const tag = document.createElement("div");
+    tag.className = "mp-tag";
+    tag.style.color = info.color;
+    tag.innerHTML = `<span></span><div class="mp-tag-hp"><i></i></div>`;
+    tag.querySelector("span")!.textContent = info.nick;
+    this.ui.append(tag);
+    this.remotes.set(info.id, { info, player, state: null, tag, hpBar: tag.querySelector("i")!, beams: null, zapT: 0, blastT: 0, lobT: 0, gun: 0 });
+  }
+
+  private removePlayer(id: number) {
+    this.infos.delete(id);
+    const r = this.remotes.get(id);
+    if (!r) return;
+    this.g.enemies.removePilot(id);
+    r.player.dispose();
+    for (const b of r.beams ?? []) b.dispose();
+    r.tag.remove();
+    this.remotes.delete(id);
+  }
+
+  /**
+   * Back in the fight, facing the middle of the city: at our corner when a round starts; after that
+   * at one of our flags, or anywhere in the streets if we hold none. `keep` holds on to the upgrades.
+   */
+  private home(keep = true, start = false) {
+    let x: number, y = 0, z: number;
+    const ours = FLAGS.filter((_, i) => this.flags[i]?.owner === this.me);
+    if (start) [x, z] = BASES[this.mine.base];
+    else if (ours.length) {
+      const f = ours[Math.floor(Math.random() * ours.length)];
+      const a = Math.random() * Math.PI * 2, d = f.radius * 0.4;
+      [x, z, y] = [f.at[0] + Math.cos(a) * d, f.at[1] + Math.sin(a) * d, f.y];
+    } else [x, z] = streetSpot();
+    const p = this.g.player;
+    p.respawn(new Vector3(x, y, z), keep);
+    this.guard = SPAWN_GUARD;
+    p.yaw = p.facing = Math.atan2(-x, -z);
+    this.respawnT = -1;
+    this.lastHit = null;
+  }
+
+  private nick(id: number | null) {
+    return id === null ? "" : this.infos.get(id)?.nick ?? "кто-то";
+  }
+
+  private colored(id: number) {
+    const info = this.infos.get(id);
+    const span = document.createElement("b");
+    span.style.color = info?.color ?? "#fff";
+    span.textContent = info?.nick ?? "кто-то";
+    return span.outerHTML;
+  }
+
+  // ---- Messages ----
+
+  onMessage(msg: ServerMessage) {
+    const g = this.g;
+    switch (msg.t) {
+      case "joined":
+        this.addPlayer(msg.player);
+        this.log(`${this.colored(msg.player.id)} в игре`);
+        break;
+      case "left":
+        this.log(`${this.colored(msg.id)} вышел`);
+        this.removePlayer(msg.id);
+        break;
+      case "look": {
+        const info = this.infos.get(msg.id);
+        if (!info) break;
+        info.nick = msg.nick;
+        info.skin = msg.skin;
+        const r = this.remotes.get(msg.id);
+        if (r) {
+          r.tag.querySelector("span")!.textContent = msg.nick;
+          paintHero(r.player.mech, msg.skin, info.color);
+        }
+        break;
+      }
+      case "snap":
+        this.flags = msg.flags;
+        for (const [id, s] of Object.entries(msg.ps)) {
+          const r = this.remotes.get(Number(id));
+          if (r) r.state = s;
+        }
+        for (const [id, [score, kills]] of Object.entries(msg.scores)) {
+          const info = this.infos.get(Number(id));
+          if (info) (info.score = score), (info.kills = kills);
+        }
+        g.score = this.mine.score;
+        break;
+      case "hurt":
+        this.lastHit = { id: msg.from, t: this.time };
+        g.hurtPlayer(msg.dmg);
+        break;
+      case "stunned":
+        this.lastHit = { id: msg.from, t: this.time };
+        g.player.stunT = Math.max(g.player.stunT, msg.s);
+        g.hud.callout("Тебя накормили!");
+        g.sfx.nom();
+        break;
+      case "kill": {
+        const { killer, victim } = msg;
+        this.log(killer === null ? `${this.colored(victim)} разбился` : `${this.colored(killer)} сбил ${this.colored(victim)}`);
+        if (killer === this.me) {
+          g.hud.callout(`Сбит: ${this.nick(victim)}`);
+          g.sfx.callout(0);
+        }
+        break;
+      }
+      case "rocket": {
+        const from = Vector3.FromArray(msg.from), dir = Vector3.FromArray(msg.dir);
+        g.projectiles.rocket(from, dir, g, true);
+        g.sfx.rocket(0.8 * Math.max(0, 1 - Vector3.Distance(from, g.player.pos) / 150));
+        break;
+      }
+      case "captured":
+        if (msg.by === this.me) {
+          g.hud.banner(`Флаг ${FLAGS[msg.flag].name} твой`, 2);
+          g.sfx.powerup();
+        } else this.log(`${this.colored(msg.by)} взял флаг ${FLAGS[msg.flag].name}`);
+        break;
+      case "crate":
+        g.loot.add(msg.crate);
+        break;
+      case "taken":
+        g.loot.open(msg.crate, msg.by === this.me, g);
+        break;
+      case "item":
+        this.addItem(msg.item);
+        break;
+      case "grabbed":
+        this.grabbed(msg.item, msg.by, msg.kind);
+        break;
+      case "mine":
+        this.addMine(msg.mine);
+        break;
+      case "boom":
+        this.boom(msg.mine, msg.victim);
+        break;
+      case "win":
+        this.winner = msg.id;
+        g.hud.banner(msg.id === this.me ? "Ты победил!" : `Победил ${this.nick(msg.id)}`, 8);
+        if (msg.id === this.me) g.sfx.victory();
+        break;
+      case "round":
+        this.winner = null;
+        for (const info of this.infos.values()) info.score = info.kills = 0;
+        g.hud.banner("Новый раунд", 2);
+        this.coinPoints = 0;
+        this.home(false, true);
+        break;
+    }
+  }
+
+  // ---- Our side ----
+
+  /** Every other player's robot, hit by one of our weapons. */
+  hitPilot(id: number, dmg: number) {
+    this.net.hit(id, dmg);
+  }
+
+  stunPilot(id: number, seconds: number) {
+    if (seconds > 0) this.net.send({ t: "stun", to: id, s: seconds });
+  }
+
+  rocket(from: Vector3, dir: Vector3) {
+    this.net.send({ t: "rocket", from: from.asArray() as [number, number, number], dir: dir.asArray() as [number, number, number] });
+  }
+
+  /** We went down: whoever hit us last (lately) gets the kill; back at base after a while. */
+  died() {
+    const by = this.lastHit && this.time - this.lastHit.t < KILL_CREDIT ? this.lastHit.id : null;
+    this.net.send({ t: "died", by });
+    this.respawnT = RESPAWN_TIME;
+    this.g.hud.banner(by !== null ? `Тебя сбил ${this.nick(by)}` : "Робот уничтожен", 2.5);
+  }
+
+  look(nick: string, skin: PlayerInfo["skin"]) {
+    this.mine.nick = nick;
+    this.mine.skin = skin;
+    this.net.send({ t: "look", nick, skin });
+  }
+
+  update(dt: number, aim: Vector3) {
+    const g = this.g;
+    this.time += dt;
+    if (this.respawnT >= 0) {
+      this.respawnT -= dt;
+      g.hud.banner(`Возрождение через ${Math.max(1, Math.ceil(this.respawnT))}…`, 0.3);
+      if (this.respawnT < 0) this.home();
+    }
+    this.sendT -= dt;
+    if (this.sendT <= 0) {
+      this.sendT = SEND_INTERVAL;
+      const p = g.player, v = p.velocity;
+      const r = (n: number) => Math.round(n * 100) / 100;
+      this.net.send({
+        t: "state",
+        s: {
+          x: r(p.pos.x), y: r(p.pos.y), z: r(p.pos.z), yaw: r(p.yaw), pitch: r(p.pitch), vx: r(v.x), vz: r(v.z),
+          g: p.grounded, th: p.thrusting, al: p.alive, f: g.input.fire && g.state === "playing", alt: g.input.alt && g.state === "playing",
+          sp: p.special, ax: r(aim.x), ay: r(aim.y), az: r(aim.z), hp: Math.round(p.hp + p.shield),
+          pr: this.guard > 0,
+        },
+      });
+      this.net.flush();
+    }
+    if (this.guard > 0) {
+      const shooting = g.state === "playing" && (g.input.fire || g.input.alt || g.input.down("KeyE"));
+      this.guard = shooting ? 0 : Math.max(0, this.guard - dt);
+      g.player.mech.setFlash(this.guard > 0 && Math.sin(this.time * 18) > 0);
+    }
+    for (const r of this.remotes.values()) this.updateRemote(r, dt);
+    this.updateFlags();
+    this.updateItems(dt);
+    this.updateMines();
+    this.updateUi();
+  }
+
+  // ---- Coins and tripwire kits ----
+
+  private buildItems() {
+    const scene = this.g.scene;
+    // A gold coin standing on its edge, and a red reel of tripwire.
+    const coin = MeshBuilder.CreateCylinder("coin", { diameter: 1.5, height: 0.2, tessellation: 20 }, scene);
+    coin.rotation.x = Math.PI / 2;
+    coin.bakeCurrentTransformIntoVertices();
+    const gold = new StandardMaterial("coin", scene);
+    gold.diffuseColor = new Color3(1, 0.78, 0.15);
+    gold.emissiveColor = new Color3(0.55, 0.38, 0.02);
+    gold.specularColor = new Color3(1, 0.9, 0.5);
+    coin.material = gold;
+    const reel = MeshBuilder.CreateCylinder("wireKit", { diameter: 1.1, height: 0.7, tessellation: 14 }, scene);
+    reel.material = this.glow("wireKit", "#ff3030", 1);
+    for (const m of [coin, reel]) {
+      m.isPickable = false;
+      m.setEnabled(false);
+      this.flagMeshes.push(m);
+    }
+    return { coin, wire: reel };
+  }
+
+  private addItem(info: ItemInfo) {
+    const mesh = this.itemBases[info.kind].clone(`item${info.id}`);
+    mesh.setEnabled(true);
+    mesh.position.set(info.x, info.y, info.z);
+    this.items.set(info.id, { info, mesh, asked: -9 });
+  }
+
+  private grabbed(id: number, by: number, kind: ItemInfo["kind"]) {
+    const item = this.items.get(id);
+    if (item) {
+      this.g.fx.spark(item.mesh.position, 12);
+      item.mesh.dispose();
+      this.items.delete(id);
+    }
+    if (by !== this.me) return;
+    const g = this.g;
+    if (kind === "wire") {
+      this.wires = Math.min(MAX_WIRES, this.wires + 1);
+      g.hud.banner(`Растяжка ${this.wires}/${MAX_WIRES} · F`, 2);
+      g.sfx.powerup();
+      return;
+    }
+    const before = Math.floor(this.coinPoints / BOOST_EVERY);
+    this.coinPoints += COIN_POINTS;
+    g.sfx.coin();
+    g.popup(g.player.chest().addInPlaceFromFloats(0, 2.5, 0), `+${COIN_POINTS}`);
+    if (Math.floor(this.coinPoints / BOOST_EVERY) > before) g.offerBoost();
+  }
+
+  /** Spinning items; walking up to one asks the server for it (the first to ask gets it). */
+  private updateItems(dt: number) {
+    const p = this.g.player;
+    for (const [id, it] of this.items) {
+      it.mesh.rotation.y += dt * 2.5;
+      it.mesh.position.y = it.info.y + Math.sin(this.time * 3 + id) * 0.25;
+      // Some coins hang in the air or sit on roofs: close enough means at about the same height, too.
+      const near = Math.hypot(it.info.x - p.pos.x, it.info.z - p.pos.z) < GRAB_RADIUS && Math.abs(p.pos.y + 2.5 - it.info.y) < 3.5;
+      if (!near || !p.alive || this.time - it.asked < 1) continue;
+      if (it.info.kind === "wire" && this.wires >= MAX_WIRES) continue;
+      it.asked = this.time;
+      this.net.send({ t: "grab", item: id });
+    }
+  }
+
+  // ---- Tripwires ----
+
+  private addMine(info: MineInfo) {
+    const scene = this.g.scene;
+    const a = Vector3.FromArray(info.a), b = Vector3.FromArray(info.b);
+    const wire = MeshBuilder.CreateCylinder(`mine${info.id}`, { diameter: 0.09, height: 1, tessellation: 6 }, scene);
+    this.stretch(wire, a, b);
+    wire.material = info.owner === this.me ? this.ownWireMat : this.wireMat;
+    const meshes = [wire];
+    for (const end of [a, b]) {
+      const peg = MeshBuilder.CreateBox(`minePeg${info.id}`, { size: 0.45 }, scene);
+      peg.position.copyFrom(end);
+      peg.material = this.ownWireMat;
+      meshes.push(peg);
+    }
+    for (const m of meshes) m.isPickable = false;
+    this.mines.set(info.id, { info, meshes, asked: false, born: this.time });
+  }
+
+  /** Lays a unit-height cylinder from a to b. */
+  private stretch(m: Mesh, a: Vector3, b: Vector3) {
+    const d = b.subtract(a);
+    m.position.copyFrom(a.add(b).scale(0.5));
+    m.scaling.set(1, d.length(), 1);
+    // The cylinder runs along Y; turn Y onto a→b.
+    const up = Vector3.Up(), dir = d.normalize();
+    const axis = Vector3.Cross(up, dir);
+    const angle = Math.acos(Math.max(-1, Math.min(1, Vector3.Dot(up, dir))));
+    m.rotationQuaternion = axis.lengthSquared() < 1e-6 ? null : Quaternion.RotationAxis(axis.normalize(), angle);
+    if (!m.rotationQuaternion) m.rotation.x = dir.y < 0 ? Math.PI : 0;
+  }
+
+  private boom(id: number, victim: number | null) {
+    const mine = this.mines.get(id);
+    if (!mine) return;
+    for (const m of mine.meshes) m.dispose();
+    this.mines.delete(id);
+    const g = this.g;
+    const at = Vector3.FromArray(mine.info.a).add(Vector3.FromArray(mine.info.b)).scale(0.5);
+    if (victim === null) return g.fx.pop(at);
+    const where = victim === this.me ? g.player.chest() : this.remotes.get(victim)?.player.chest() ?? at;
+    g.fx.explosion(where, 1.4);
+    g.sfx.explode(false, Vector3.Distance(where, g.player.pos));
+    g.addShake(Vector3.Distance(where, g.player.pos), 0.6);
+    if (victim === this.me) {
+      this.lastHit = mine.info.owner === this.me ? null : { id: mine.info.owner, t: this.time };
+      g.hurtPlayer(MINE_DAMAGE);
+      g.hud.callout("Растяжка!");
+    } else if (mine.info.owner === this.me) g.hud.callout(`${this.nick(victim)} на растяжке!`);
+    if (victim === this.me && mine.info.owner === this.me) g.hud.callout("На своей же растяжке!");
+  }
+
+  /** Setting tripwires (F, R to turn), and running into other people's. */
+  private updateMines() {
+    const g = this.g, p = g.player;
+    const blink = 0.4 + 0.25 * Math.sin(this.time * 6);
+    this.wireMat.alpha = blink;
+    if (p.alive && this.guard === 0) {
+      const spheres = p.hitSpheres();
+      for (const [id, m] of this.mines) {
+        // Our own as well: watch your step.
+        if (m.asked || this.time - m.born < MINE_ARM) continue;
+        const a = Vector3.FromArray(m.info.a), b = Vector3.FromArray(m.info.b);
+        if (spheres.some(([c, r]) => segSphere(a, b, c, r + 0.2))) {
+          m.asked = true;
+          this.net.send({ t: "trip", mine: id });
+        }
+      }
+    }
+    const playing = g.state === "playing" && p.alive;
+    if (playing && g.input.pressed("KeyR") && this.wires > 0) {
+      this.vertical = !this.vertical;
+      g.hud.banner(this.vertical ? "Растяжка: вертикально" : "Растяжка: горизонтально", 1.2);
+    }
+    const spot = playing && this.wires > 0 ? this.wireSpot() : null;
+    this.preview.setEnabled(!!spot);
+    if (!spot) return;
+    this.stretch(this.preview, spot[0], spot[1]);
+    if (!g.input.pressed("KeyF")) return;
+    this.wires--;
+    g.sfx.click();
+    const r = (v: Vector3) => v.asArray().map((n) => Math.round(n * 100) / 100) as [number, number, number];
+    this.net.send({ t: "plant", a: r(spot[0]), b: r(spot[1]) });
+  }
+
+  /**
+   * Where a tripwire would go: on the surface under the crosshair, within reach. Horizontal runs
+   * across the way we look (on the ground, at shin height) or along a wall; vertical stands up
+   * from the ground or runs up the wall. Cut short where it would go into a wall.
+   */
+  private wireSpot(): [Vector3, Vector3] | null {
+    const g = this.g, look = g.player.look(), o = g.camera.position;
+    const hit = g.city.raycastHit(o, look, PLANT_REACH);
+    if (hit.t >= PLANT_REACH) return null;
+    const n = hit.normal, up = Vector3.Up();
+    const p = o.add(look.scale(hit.t));
+    const flat = Math.abs(n.y) > 0.7;
+    if (this.vertical && flat) {
+      const a = p.add(up.scale(0.3));
+      return [a, a.add(up.scale(Math.min(WIRE_LENGTH, g.city.raycast(a, up, WIRE_LENGTH) - 0.2)))];
+    }
+    const centre = p.add(n.scale(flat ? 1.2 : 0.8));
+    const dir = this.vertical ? up : flat ? new Vector3(-look.z, 0, look.x).normalize() : Vector3.Cross(n, up).normalize();
+    const reach = (d: Vector3) => Math.min(WIRE_LENGTH / 2, g.city.raycast(centre, d, WIRE_LENGTH / 2) - 0.2);
+    return [centre.add(dir.scale(-reach(dir.scale(-1)))), centre.add(dir.scale(reach(dir)))];
+  }
+
+  /** Another robot: where the server last saw it, posed and firing (for show) like ours. */
+  private updateRemote(r: Remote, dt: number) {
+    const g = this.g, s = r.state, p = r.player;
+    if (!s) return;
+    if (!s.al && p.alive) {
+      p.die();
+      setTimeout(() => {
+        if (p.alive) return;
+        g.fx.explosion(p.chest(), 1.8);
+        g.sfx.explode(true, Vector3.Distance(p.pos, g.player.pos));
+        p.hide();
+      }, 1100);
+    } else if (s.al && !p.alive) p.respawn(new Vector3(s.x, s.y, s.z));
+    p.follow(dt, s);
+    const e = g.enemies.list.find((x) => x.pilot === r.info.id);
+    if (e) {
+      e.pos.copyFrom(p.pos);
+      e.yaw = p.facing;
+    }
+    const aim = new Vector3(s.ax, s.ay, s.az);
+    const firing = s.f && s.al;
+    p.pose(dt, aim, firing);
+    // A robot just back from the dead blinks while nothing can hurt it.
+    const enemy = g.enemies.list.find((x) => x.pilot === r.info.id);
+    if (enemy && s.pr) enemy.flashT = Math.sin(this.time * 18) > 0 ? 0.05 : 0;
+    // Their shots, for show: the damage is dealt by their game.
+    if (firing && !s.sp) {
+      const shot = p.fire(dt, true);
+      if (shot) g.projectiles.spawn(shot.from, shot.dir.scale(BULLET_SPEED), "tracer", 0);
+    }
+    const lasing = firing && s.sp === "laser";
+    if (lasing) r.beams ??= [new LaserBeam(g.scene), new LaserBeam(g.scene)];
+    p.guns.forEach((gun, i) => {
+      if (!r.beams) return;
+      if (!lasing) return r.beams[i].hide();
+      const from = gun.muzzlePosition();
+      const dir = aim.subtract(from).normalize();
+      r.beams[i].show(from, from.add(dir.scale(g.city.raycast(from, dir, LASER_RANGE))));
+    });
+    r.zapT -= dt;
+    r.blastT -= dt;
+    r.lobT -= dt;
+    if (firing && s.sp === "tesla" && r.zapT <= 0) {
+      r.zapT = 0.1;
+      r.gun = 1 - r.gun;
+      g.lightning.zap(p.guns[r.gun].muzzlePosition(), aim);
+    }
+    if (firing && s.sp === "shawarma" && r.blastT <= 0) {
+      r.blastT = 0.11;
+      r.gun = 1 - r.gun;
+      const from = p.guns[r.gun].muzzlePosition();
+      g.shawarma.blast(from, aim.subtract(from).normalize(), 0);
+    }
+    if (s.alt && s.al && r.lobT <= 0) {
+      r.lobT = 0.45;
+      g.shawarma.lob(p.chest().addInPlaceFromFloats(0, 0.8, 0), aim, 0);
+    }
+  }
+
+  // ---- Flags ----
+
+  private buildFlags() {
+    const scene = this.g.scene;
+    const glowing = (name: string, alpha = 1) => {
+      const m = new StandardMaterial(name, scene);
+      m.diffuseColor = Color3.Black();
+      m.emissiveColor = Color3.FromHexString(NEUTRAL);
+      m.disableLighting = true;
+      m.alpha = alpha;
+      return m;
+    };
+    const pole = MeshBuilder.CreateCylinder("flagPole", { diameter: 0.35, height: 14, tessellation: 8 }, scene);
+    pole.material = new StandardMaterial("flagPole", scene);
+    (pole.material as StandardMaterial).diffuseColor = new Color3(0.55, 0.57, 0.6);
+    pole.setEnabled(false);
+    this.flagMeshes.push(pole);
+    FLAGS.forEach((flag, i) => {
+      const [x, z] = flag.at;
+      // On a roof the pole stands to one side, clear of anything in the middle.
+      const px = flag.y ? x + flag.radius * 0.5 : x;
+      const p = pole.createInstance(`flagPole${i}`);
+      p.position.set(px, flag.y + 7, z);
+      this.g.shadows.addShadowCaster(p);
+      const cloth = glowing(`flagCloth${i}`);
+      const clothMesh = MeshBuilder.CreateBox(`flagCloth${i}`, { width: 4.2, height: 2.6, depth: 0.08 }, scene);
+      clothMesh.position.set(px + 2.2, flag.y + 12.5, z);
+      clothMesh.material = cloth;
+      const ring = glowing(`flagRing${i}`, 0.55);
+      const ringMesh = MeshBuilder.CreateTorus(`flagRing${i}`, { diameter: flag.radius * 2, thickness: 0.35, tessellation: 64 }, scene);
+      ringMesh.position.set(x, flag.y + 0.12, z);
+      ringMesh.material = ring;
+      const progressMat = glowing(`flagProgress${i}`, 0.3);
+      const progress = MeshBuilder.CreateDisc(`flagProgress${i}`, { radius: flag.radius, tessellation: 48 }, scene);
+      progress.rotation.x = Math.PI / 2;
+      progress.position.set(x, flag.y + 0.1, z);
+      progress.material = progressMat;
+      progress.setEnabled(false);
+      for (const m of [clothMesh, ringMesh, progress]) m.isPickable = false;
+      this.flagMeshes.push(clothMesh, ringMesh, progress);
+      this.views.push({ cloth, ring, progress, progressMat, clothMesh });
+    });
+  }
+
+  private flagColor(id: number | null) {
+    return Color3.FromHexString(id === null ? NEUTRAL : this.infos.get(id)?.color ?? NEUTRAL);
+  }
+
+  private updateFlags() {
+    this.flags.forEach((f, i) => {
+      const v = this.views[i];
+      if (!v) return;
+      const owner = this.flagColor(f.owner);
+      v.cloth.emissiveColor = owner;
+      v.ring.emissiveColor = f.contested ? (Math.sin(this.time * 12) > 0 ? new Color3(1, 0.2, 0.2) : owner) : owner;
+      v.clothMesh.rotation.y = Math.sin(this.time * 2 + i) * 0.15;
+      const taking = f.taker !== null && f.progress > 0;
+      v.progress.setEnabled(taking);
+      if (taking) {
+        v.progress.scaling.setAll(Math.max(0.02, f.progress));
+        v.progressMat.emissiveColor = this.flagColor(f.taker);
+      }
+    });
+  }
+
+  // ---- Screen ----
+
+  private updateUi() {
+    const g = this.g;
+    // Name tags over the other robots.
+    const w = g.engine.getRenderWidth(), h = g.engine.getRenderHeight();
+    const canvas = g.engine.getRenderingCanvas()!;
+    const transform = g.scene.getTransformMatrix();
+    const viewport = g.camera.viewport.toGlobal(w, h);
+    for (const r of this.remotes.values()) {
+      const p = r.player;
+      const at = Vector3.Project(new Vector3(p.pos.x, p.pos.y + 6.6, p.pos.z), Matrix.Identity(), transform, viewport);
+      const dist = Vector3.Distance(p.pos, g.camera.position);
+      const shown = r.state?.al && at.z > 0 && at.z < 1 && dist < 300;
+      r.tag.style.display = shown ? "" : "none";
+      if (!shown) continue;
+      r.tag.style.transform = `translate(${(at.x / w) * canvas.clientWidth}px, ${(at.y / h) * canvas.clientHeight}px) translate(-50%, -100%)`;
+      r.hpBar.style.width = `${Math.max(0, Math.min(1, (r.state?.hp ?? 0) / 160)) * 100}%`;
+    }
+
+    // The flags along the top, coloured by owner; one being taken blinks in the taker's colour.
+    this.flagBar.innerHTML = this.flags
+      .map((f, i) => {
+        const owner = f.owner === null ? NEUTRAL : this.infos.get(f.owner)?.color ?? NEUTRAL;
+        const blink = (f.taker !== null && f.progress > 0) || f.contested ? " blink" : "";
+        return `<span class="mp-flag${blink}" style="border-color:${owner};color:${owner}">${FLAGS[i].name}</span>`;
+      })
+      .join("");
+
+    // Score board: first to TARGET_SCORE.
+    const rows = [...this.infos.values()].sort((a, b) => b.score - a.score);
+    this.board.innerHTML =
+      `<div class="mp-room">Комната <b>${this.room}</b> · до ${TARGET_SCORE}</div>` +
+      rows
+        .map((p) => {
+          const held = this.flags.filter((f) => f.owner === p.id).length;
+          const row = document.createElement("div");
+          row.className = p.id === this.me ? "mp-row me" : "mp-row";
+          row.innerHTML = `<i style="background:${p.color}"></i><span></span><b>${p.score}</b><em>⚑${held} ✖${p.kills}</em>`;
+          row.querySelector("span")!.textContent = p.nick;
+          return row.outerHTML;
+        })
+        .join("") +
+      `<div class="mp-own">Монеты: ${this.coinPoints % BOOST_EVERY}/${BOOST_EVERY} до буста</div>` +
+      (this.wires ? `<div class="mp-own">Растяжки: ${this.wires} · F поставить · R ${this.vertical ? "↕" : "↔"}</div>` : "");
+
+    // Taking a flag: how far along, or that someone is in the way.
+    const pos = g.player.pos;
+    const here = FLAGS.findIndex((f) => inZone(f, pos.x, pos.y, pos.z));
+    const f = here >= 0 ? this.flags[here] : null;
+    let text = "";
+    if (f && g.player.alive) {
+      const name = FLAGS[here].name;
+      if (f.contested) text = `Флаг ${name} оспаривается!`;
+      else if (f.owner === this.me) text = `Флаг ${name} твой`;
+      else if (f.taker === this.me) text = `Захват флага ${name}: ${Math.round(f.progress * 100)}%`;
+      else text = `Захват флага ${name}…`;
+    }
+    this.capture.textContent = text;
+    this.capture.style.opacity = text ? "1" : "0";
+  }
+
+  private log(html: string) {
+    const line = document.createElement("div");
+    line.innerHTML = html;
+    this.feed.prepend(line);
+    setTimeout(() => line.remove(), 6000);
+    while (this.feed.children.length > 5) this.feed.lastElementChild!.remove();
+  }
+
+  /** The minimap: our tripwires, and each flag as a letter in its owner's colour. Coins and weapons are for finding. */
+  drawMap(c: CanvasRenderingContext2D, px: (x: number) => number, pz: (z: number) => number) {
+    c.strokeStyle = "#ff5a5a";
+    c.lineWidth = 2;
+    for (const m of this.mines.values()) {
+      if (m.info.owner !== this.me) continue;
+      c.beginPath();
+      c.moveTo(px(m.info.a[0]), pz(m.info.a[2]));
+      c.lineTo(px(m.info.b[0]), pz(m.info.b[2]));
+      c.stroke();
+    }
+    c.font = "bold 11px sans-serif";
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    this.flags.forEach((f, i) => {
+      const [x, z] = FLAGS[i].at;
+      c.fillStyle = f.owner === null ? NEUTRAL : this.infos.get(f.owner)?.color ?? NEUTRAL;
+      c.beginPath();
+      c.arc(px(x), pz(z), 7, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = "#111";
+      c.fillText(FLAGS[i].name, px(x), pz(z) + 0.5);
+    });
+  }
+
+  dispose() {
+    for (const id of [...this.remotes.keys()]) this.removePlayer(id);
+    for (const it of this.items.values()) it.mesh.dispose();
+    for (const m of this.mines.values()) for (const mesh of m.meshes) mesh.dispose();
+    this.preview.dispose();
+    paintHero(this.g.player.mech, this.g.skin);
+    for (const m of this.flagMeshes) m.dispose();
+    this.ui.remove();
+    document.body.classList.remove("mp");
+    this.net.close();
+  }
+}

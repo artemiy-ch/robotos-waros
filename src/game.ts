@@ -11,6 +11,8 @@ import {
   UniversalCamera,
   Vector3,
 } from "@babylonjs/core";
+import type { ServerMessage } from "../shared/mp";
+import { Arena } from "./arena";
 import { BLOCKS, City, crossing, type Theme } from "./city";
 import { CrashSite } from "./crash";
 import { Destruction } from "./destruction";
@@ -21,6 +23,7 @@ import { Hud } from "./hud";
 import { Input } from "./input";
 import { Loot } from "./loot";
 import { Models } from "./models";
+import { Net } from "./net";
 import { Pickups } from "./pickups";
 import { Props } from "./props";
 import { FIRE_INTERVAL, Player } from "./player";
@@ -119,6 +122,8 @@ const DUSK_TIME = 5;
 /** Waves 1–2 by day, 3–4 by night, and so on. */
 const isDay = (wave: number) => Math.floor((Math.max(1, wave) - 1) / 2) % 2 === 0;
 
+const SOLO_INVITE = "Город захвачен роботами. Кликни, чтобы начать";
+
 const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 const mixLook = (a: Look, b: Look, t: number): Look => ({
@@ -148,8 +153,12 @@ export class Game {
   props!: Props;
   loot!: Loot;
   private beams: LaserBeam[];
-  private shawarma: Shawarma;
-  private lightning: Lightning;
+  readonly shawarma: Shawarma;
+  readonly lightning: Lightning;
+  /** Multiplayer: the room we are in (null in the single-player game), and which game the start screen is set to. */
+  arena: Arena | null = null;
+  private mode: "solo" | "mp" = "solo";
+  private joining: Net | null = null;
   private teslaT = 0;
   private teslaGun = 0;
   private busterT = 0;
@@ -184,8 +193,8 @@ export class Game {
   score = 0;
   wave = 0;
   private sun: DirectionalLight;
-  private shadows: ShadowGenerator;
-  private models: Models;
+  readonly shadows: ShadowGenerator;
+  readonly models: Models;
   private shake = 0;
   private waveTimer = -1;
   /** Upgrades on offer after a cleared wave, and the last wave that has had its offer. */
@@ -247,7 +256,7 @@ export class Game {
     this.lightning = new Lightning(scene);
     this.shawarma = new Shawarma(scene);
     this.models = new Models(scene, shadows);
-    this.hud.onOverlayClick(() => this.onOverlayClick());
+    this.hud.onOverlayClick((e) => this.onOverlayClick(e));
     this.fx.onExplosion = (at, scale) => {
       this.destruction.scrap(at, scale);
       const dist = Vector3.Distance(at, this.player?.pos ?? at);
@@ -285,7 +294,21 @@ export class Game {
         // Not remembered, then.
       }
     });
-    this.hud.showOverlay("ROBOT WARS", "Город захвачен роботами. Кликни, чтобы начать", true);
+    this.hud.setupModes({
+      mode: (mode) => {
+        this.mode = mode;
+        this.hud.overlayText(mode === "mp" ? "Создай комнату или введи код друга" : SOLO_INVITE);
+      },
+      create: () => this.startMultiplayer(null),
+      join: (code) => this.startMultiplayer(code),
+    });
+    this.hud.showOverlay("ROBOT WARS", SOLO_INVITE, true);
+    // A link from a friend: straight into their room.
+    const invited = new URLSearchParams(location.search).get("room");
+    if (invited) {
+      this.hud.pickMode("mp", invited);
+      this.startMultiplayer(invited);
+    }
     this.engine.runRenderLoop(() => this.frame());
   }
 
@@ -331,7 +354,8 @@ export class Game {
   /** The look picked on the start screen. */
   setPilot(nick: string, skin: Skin) {
     this.nick = nick;
-    if (skin !== this.skin || !this.painted) paintHero(this.player.mech, skin);
+    this.arena?.look(nick, skin);
+    if (skin !== this.skin || !this.painted) paintHero(this.player.mech, skin, this.arena?.color);
     this.skin = skin;
     this.painted = true;
   }
@@ -364,11 +388,87 @@ export class Game {
     this.hud.hideUpgrades();
   }
 
-  private onOverlayClick() {
+  private onOverlayClick(e: MouseEvent) {
     if (this.state === "loading") return;
+    const target = e.target as HTMLElement;
+    if (target.id === "mp-leave") return this.leaveArena();
+    if (target.id === "mp-copy") {
+      void navigator.clipboard?.writeText(this.inviteLink());
+      target.textContent = "Скопировано";
+      return;
+    }
+    // In the multiplayer menu the game starts from a room, not from a click.
+    if (this.mode === "mp" && !this.arena) return;
     this.sfx.unlock();
     if (this.state === "dead" || this.state === "won") this.reset();
     this.input.lock();
+  }
+
+  // ---- Multiplayer ----
+
+  private inviteLink() {
+    return `${location.origin}${location.pathname}?room=${this.arena?.room ?? ""}`;
+  }
+
+  /** Connects and joins a room by its code, or makes a new room (null). */
+  private startMultiplayer(code: string | null) {
+    if (this.joining || this.arena) return;
+    this.hud.mpStatus("Подключение…");
+    const net = (this.joining = new Net(
+      (msg) => this.onServer(net, msg),
+      (reason) => {
+        if (this.joining === net) {
+          this.joining = null;
+          this.hud.mpStatus(reason);
+        } else if (this.arena) this.leaveArena(reason);
+      },
+    ));
+    net.join(code, this.nick, this.skin);
+  }
+
+  private onServer(net: Net, msg: ServerMessage) {
+    if (msg.t === "welcome") return this.enterArena(net, msg);
+    if (msg.t === "nope" || msg.t === "full") {
+      this.joining = null;
+      net.close();
+      this.hud.mpStatus(msg.t === "nope" ? "Нет такой комнаты" : "Комната заполнена");
+      return;
+    }
+    this.arena?.onMessage(msg);
+  }
+
+  private enterArena(net: Net, welcome: Extract<ServerMessage, { t: "welcome" }>) {
+    this.joining = null;
+    this.hud.mpStatus("");
+    // No falling buildings, no waves: just the players, the flags and the crates the server hands out.
+    this.destruction.enabled = false;
+    this.loot.network = { take: (id) => net.send({ t: "take", crate: id }) };
+    this.reset();
+    this.arena = new Arena(this, net, welcome);
+    history.replaceState(null, "", this.inviteLink());
+    this.state = "menu";
+    this.showLobby();
+  }
+
+  private showLobby() {
+    this.hud.showOverlay(
+      `Комната ${this.arena!.room}`,
+      `Позови друзей — отправь им ссылку:<br><span class="mp-link">${this.inviteLink()}</span> <button type="button" id="mp-copy" class="mp-button">Копировать</button><br>Захватывай флаги: кто первым наберёт очки, тот и победил.<br><b>Кликни, чтобы в бой</b><br><button type="button" id="mp-leave" class="mp-button">Выйти из комнаты</button>`,
+    );
+  }
+
+  /** Back to the single-player start screen. */
+  private leaveArena(reason?: string) {
+    this.arena?.dispose();
+    this.arena = null;
+    this.loot.network = null;
+    this.destruction.enabled = true;
+    history.replaceState(null, "", location.pathname);
+    if (document.pointerLockElement) document.exitPointerLock();
+    this.reset();
+    this.state = "menu";
+    this.hud.showOverlay("ROBOT WARS", reason ?? "Создай комнату или введи код друга", true);
+    this.hud.pickMode("mp");
   }
 
   private onLockChange(locked: boolean) {
@@ -380,7 +480,9 @@ export class Game {
       this.sfx.jet(0);
       this.sfx.laser(false);
       this.sfx.tesla(false);
-      this.hud.showOverlay("Пауза", "Кликни, чтобы продолжить");
+      if (this.arena)
+        this.hud.showOverlay("Пауза", `Бой продолжается — тебя могут сбить!<br>Кликни, чтобы вернуться<br><button type="button" id="mp-leave" class="mp-button">Выйти из комнаты</button>`);
+      else this.hud.showOverlay("Пауза", "Кликни, чтобы продолжить");
     }
   }
 
@@ -415,8 +517,10 @@ export class Game {
     // Zoom in a little in slow motion.
     const fov = this.slowT > 0 ? FOV * 0.82 : FOV;
     this.camera.fov += (fov - this.camera.fov) * Math.min(1, real * 8);
-    this.scene.animationsEnabled = this.state !== "paused";
-    if (this.state === "playing") this.update(dt);
+    // A room's fight goes on behind the menus.
+    const live = this.state === "playing" || (!!this.arena && this.state !== "loading");
+    this.scene.animationsEnabled = live || this.state !== "paused";
+    if (live) this.update(dt);
     else if (this.state !== "paused") {
       this.input.consumeLook();
       if (this.state === "menu") this.player.yaw += dt * 0.15;
@@ -427,7 +531,7 @@ export class Game {
       this.player.updateCamera(this.camera, this.city, this.shake);
       this.shake = Math.max(0, this.shake - dt * 2);
     }
-    if (this.state !== "paused") {
+    if (this.state !== "paused" || this.arena) {
       this.fx.update(dt);
       this.destruction.update(dt);
       this.crash?.update(dt);
@@ -460,7 +564,7 @@ export class Game {
     this.shake = Math.max(0, this.shake - dt * 2);
     player.updateCamera(this.camera, this.city, this.shake);
     const aim = this.aimPoint();
-    if (player.pose(dt, aim, input.fire)) this.sfx.step(player.steps, input.down("ShiftLeft", "ShiftRight"));
+    if (player.pose(dt, aim, this.trigger)) this.sfx.step(player.steps, input.down("ShiftLeft", "ShiftRight"));
     if (player.landed) {
       if (player.landed >= SLAM_SPEED) this.slam(player.landed);
       else {
@@ -475,12 +579,11 @@ export class Game {
       // The legs take the hit; the Moon's low gravity softens it.
       const k = Math.min(1, Math.max(0, (player.fell - FALL_SAFE) / (FALL_FATAL - FALL_SAFE))) * player.gravity;
       if (k > 0) this.hurtPlayer(k * FALL_MAX * player.maxHp, "fall");
-      if (k > 0.2 && player.alive) this.hud.callout("Яйцами пёзднулся");
       player.fell = 0;
     }
     this.sfx.jet(player.thrusting ? 1 : 0);
 
-    const shot = player.fire(dt, input.fire);
+    const shot = player.fire(dt, this.trigger);
     if (shot) {
       this.projectiles.spawn(shot.from, shot.dir.scale(BULLET_SPEED), "tracer", player.stats.gunDamage);
       this.fx.casing(shot.from.subtract(shot.dir.scale(1.2)), shot.right);
@@ -490,16 +593,25 @@ export class Game {
     this.updateLaser(dt, aim);
     this.updateTesla(dt, aim);
     this.updateBuster(dt, aim);
-    this.shawarma.update(dt, input.alt, player.chest().addInPlaceFromFloats(0, 0.8, 0), aim, this);
-    const rocket = player.rockets(dt, input.down("KeyE"));
+    this.shawarma.update(dt, input.alt && this.state === "playing" && player.stunT === 0, player.chest().addInPlaceFromFloats(0, 0.8, 0), aim, this);
+    const rocket = player.rockets(dt, input.down("KeyE") && this.state === "playing");
     if (rocket) {
       this.projectiles.rocket(rocket.from, rocket.dir, this);
+      this.arena?.rocket(rocket.from, rocket.dir);
       this.sfx.rocket();
     }
 
     this.sun.position.copyFrom(player.pos).subtractInPlace(this.sun.direction.scale(250));
     this.updateWorld(dt);
-    this.updateWaves(dt);
+    if (this.arena) {
+      this.arena.update(dt, aim);
+      if (this.upgradeOffer) this.pickUpgrade();
+    } else this.updateWaves(dt);
+  }
+
+  /** The trigger: the left button, while actually playing and not dazed by a shawarma. */
+  private get trigger() {
+    return this.input.fire && this.state === "playing" && this.player.stunT === 0;
   }
 
   /** Coming down hard: a shockwave that hurts and throws back everything around. */
@@ -521,7 +633,7 @@ export class Game {
   /** While the power-up lasts, both cannons cut with beams that reach the crosshair instantly. */
   private updateLaser(dt: number, aim: Vector3) {
     const p = this.player;
-    const firing = p.special === "laser" && p.alive && this.input.fire;
+    const firing = p.special === "laser" && p.alive && this.trigger;
     this.sfx.laser(firing);
     if (!firing) {
       for (const b of this.beams) b.hide();
@@ -555,7 +667,7 @@ export class Game {
   private updateBuster(dt: number, aim: Vector3) {
     const p = this.player;
     this.busterT -= dt;
-    if (p.special !== "shawarma" || !p.alive || !this.input.fire || this.busterT > 0) return;
+    if (p.special !== "shawarma" || !p.alive || !this.trigger || this.busterT > 0) return;
     const interval = BUSTER_INTERVAL * p.stats.fireInterval;
     this.busterT = interval;
     this.busterGun = 1 - this.busterGun;
@@ -571,7 +683,7 @@ export class Game {
 
   private updateTesla(dt: number, aim: Vector3) {
     const p = this.player;
-    const firing = p.special === "tesla" && p.alive && this.input.fire;
+    const firing = p.special === "tesla" && p.alive && this.trigger;
     this.sfx.tesla(firing);
     this.teslaT -= dt;
     if (!firing || this.teslaT > 0) return;
@@ -683,14 +795,7 @@ export class Game {
         this.hud.showUpgrades(this.upgradeOffer, this.player.levels);
         this.hud.banner(this.wave % BOSS_EVERY === 0 ? "Трофей босса" : `Волна ${this.wave} пройдена`, 2);
       }
-      const choice = ["1", "2", "3"].findIndex((n) => this.input.pressed(`Digit${n}`, `Numpad${n}`));
-      const picked = this.upgradeOffer[choice];
-      if (!picked) return;
-      this.player.upgrade(picked);
-      this.sfx.powerup();
-      this.hud.hideUpgrades();
-      this.hud.banner(picked.name, 1.5);
-      this.upgradeOffer = null;
+      if (!this.pickUpgrade()) return;
       this.offeredFor = this.wave;
       if (this.wave === BOSS_EVERY && this.city.theme === "earth") {
         this.warp = 0;
@@ -723,6 +828,29 @@ export class Game {
     }
   }
 
+  /** An upgrade on offer: takes it when 1 / 2 / 3 is pressed, and says whether one was. */
+  private pickUpgrade() {
+    const choice = ["1", "2", "3"].findIndex((n) => this.input.pressed(`Digit${n}`, `Numpad${n}`));
+    const picked = this.upgradeOffer?.[choice];
+    if (!picked) return false;
+    this.player.upgrade(picked);
+    this.sfx.powerup();
+    this.hud.hideUpgrades();
+    this.hud.banner(picked.name, 1.5);
+    this.upgradeOffer = null;
+    return true;
+  }
+
+  /** Multiplayer: enough coins for a boost, one of three upgrades like after a wave. */
+  offerBoost() {
+    if (this.upgradeOffer) return;
+    const options = offer(this.player.levels, false);
+    if (!options.length) return;
+    this.upgradeOffer = options;
+    this.hud.showUpgrades(options, this.player.levels);
+    this.hud.banner("Буст! Выбери улучшение: 1 / 2 / 3", 2.5);
+  }
+
   get multiplier() {
     return Math.min(STREAK_MAX, 1 + Math.max(0, this.streak - 1) * STREAK_STEP);
   }
@@ -733,7 +861,8 @@ export class Game {
   }
 
   hurtPlayer(dmg: number, cause: "enemy" | "fall" = "enemy") {
-    if (this.state !== "playing" || !this.player.alive) return;
+    // In a room, other players can still hit you while the menu is up; not just after coming back, though.
+    if ((this.state !== "playing" && !this.arena) || !this.player.alive || (this.arena?.guard ?? 0) > 0) return;
     this.deathCause = cause;
     const hadShield = this.player.shield > 0;
     const hull = this.player.takeHit(dmg, cause === "enemy");
@@ -753,6 +882,23 @@ export class Game {
   private deathCause: "enemy" | "fall" = "enemy";
 
   private die() {
+    if (this.arena) {
+      // In a room: blow up, and be back at base in a few seconds.
+      this.sfx.jet(0);
+      this.sfx.laser(false);
+      this.sfx.tesla(false);
+      for (const b of this.beams) b.hide();
+      this.player.die();
+      setTimeout(() => {
+        if (this.player.alive) return;
+        this.fx.explosion(this.player.chest(), 1.8);
+        this.sfx.explode(true);
+        this.shake = 1;
+        this.player.hide();
+      }, 1100);
+      this.arena.died();
+      return;
+    }
     this.state = "dead";
     this.sfx.jet(0);
     this.sfx.laser(false);

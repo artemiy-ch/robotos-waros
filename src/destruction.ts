@@ -29,6 +29,8 @@ const WINDOW = 4;
  * Every piece is an instance of a handful of box meshes, so thousands are cheap.
  */
 export class Destruction {
+  /** Off in multiplayer: falling buildings would be too much to keep in step between players. */
+  enabled = true;
   /** Per facade tint: [one window per face, 2×2 windows per face, a chip of wall]. */
   private bases: Mesh[][];
   private concrete: Mesh;
@@ -93,6 +95,7 @@ export class Destruction {
 
   /** A round hitting a wall; `chipChance` is how likely it knocks a piece off. */
   hit(box: Box | null, at: Vector3, normal: Vector3, dmg: number, g: Game, chipChance = 0.4) {
+    if (!this.enabled) return;
     const b = box?.building;
     if (!b?.standing) return;
     if (Math.random() < chipChance) this.chipOff(b, at, normal, 1 + Math.floor(Math.random() * 2), 0.25, 0.6, 8);
@@ -101,6 +104,7 @@ export class Destruction {
 
   /** An explosion: nearby buildings lose hp and shed chips towards the blast. */
   blast(at: Vector3, radius: number, dmg: number, g: Game) {
+    if (!this.enabled) return;
     for (const b of this.city.buildings) {
       if (!b.standing) continue;
       const box = b.box;

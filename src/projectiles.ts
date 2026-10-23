@@ -23,6 +23,8 @@ interface Rocket {
   /** Fired at the player (homing, hurts the player) rather than by them; with its damage. */
   hostile: boolean;
   dmg: number;
+  /** Another player's rocket, shown but harmless here (their game deals the damage). */
+  show?: boolean;
 }
 
 /** Enemy rockets: how hard they turn towards the player, their blast radius. */
@@ -83,8 +85,9 @@ export class Projectiles {
     this.bullets.push({ mesh, pos: from.clone(), vel, life: 2, kind, dmg });
   }
 
-  rocket(from: Vector3, dir: Vector3, g: Game) {
+  rocket(from: Vector3, dir: Vector3, g: Game, show = false) {
     this.launch(from, dir.scale(45), g, false, 0, 3);
+    this.rockets[this.rockets.length - 1].show = show;
   }
 
   /** A homing rocket fired at the player. */
@@ -199,7 +202,7 @@ export class Projectiles {
         g.fx.explosion(at, 1.1);
         g.sfx.explode(false, Vector3.Distance(at, g.player.pos));
         g.addShake(Vector3.Distance(at, g.player.pos), 0.5);
-        g.enemies.splash(at, ROCKET_RADIUS, ROCKET_DAMAGE, g);
+        if (!r.show) g.enemies.splash(at, ROCKET_RADIUS, ROCKET_DAMAGE, g);
         g.destruction.blast(at, ROCKET_RADIUS, ROCKET_BUILDING_DAMAGE, g);
         g.props.blast(at, ROCKET_RADIUS, g);
       }

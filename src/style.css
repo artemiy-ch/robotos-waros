@@ -575,3 +575,206 @@ kbd {
   text-transform: uppercase;
   color: #ffc93c;
 }
+
+/* ---- Multiplayer ---- */
+
+.modes {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.mode {
+  padding: 9px 22px;
+  font: inherit;
+  font-size: 16px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.06);
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  border-radius: 10px;
+  cursor: pointer;
+}
+.mode.selected {
+  border-color: #3ee8ff;
+  background: rgba(62, 232, 255, 0.12);
+}
+#mp-menu {
+  margin-bottom: 18px;
+}
+#mp-menu.hidden {
+  display: none;
+}
+.mp-button {
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 15px;
+  color: #fff;
+  background: rgba(62, 232, 255, 0.16);
+  border: 1px solid rgba(62, 232, 255, 0.6);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.mp-button:hover {
+  background: rgba(62, 232, 255, 0.28);
+}
+#mp-code {
+  width: 90px;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 16px;
+  letter-spacing: 4px;
+  text-align: center;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+  outline: none;
+}
+.mp-or {
+  margin: 0 10px;
+  opacity: 0.6;
+}
+#mp-status {
+  min-height: 20px;
+  margin-top: 8px;
+  color: #ffd23a;
+  font-size: 14px;
+}
+.mp-link {
+  display: inline-block;
+  margin: 6px 0;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  font-family: monospace;
+  user-select: all;
+}
+#ov-text .mp-button {
+  margin: 6px 4px;
+}
+
+#mp-flags {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+}
+.mp-flag {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  font-size: 17px;
+  border: 3px solid;
+  border-radius: 8px;
+  background: rgba(10, 14, 20, 0.6);
+}
+.mp-flag.blink {
+  animation: mp-blink 0.5s steps(2) infinite;
+}
+@keyframes mp-blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+#mp-board {
+  position: absolute;
+  top: 78px;
+  left: 20px;
+  min-width: 230px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(10, 14, 20, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 14px;
+}
+.mp-room {
+  margin-bottom: 6px;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.mp-row {
+  display: grid;
+  grid-template-columns: 12px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+.mp-row.me span {
+  font-weight: 800;
+}
+.mp-row i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.mp-row em {
+  font-style: normal;
+  font-size: 12px;
+  opacity: 0.7;
+}
+#mp-capture {
+  position: absolute;
+  bottom: 26%;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 16px;
+  border-radius: 8px;
+  background: rgba(10, 14, 20, 0.6);
+  font-weight: 700;
+  font-size: 17px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+#mp-feed {
+  position: absolute;
+  top: 214px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  font-size: 14px;
+}
+#mp-feed div {
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: rgba(10, 14, 20, 0.55);
+}
+.mp-tag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-weight: 800;
+  font-size: 14px;
+  text-align: center;
+  text-shadow: 0 1px 3px #000;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.mp-tag-hp {
+  width: 60px;
+  height: 4px;
+  margin: 3px auto 0;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.mp-tag-hp i {
+  display: block;
+  height: 100%;
+  background: currentColor;
+}
+
+/* No waves in a room: the score stays, the wave and enemy counts go. */
+body.mp #stats > div:nth-last-child(-n + 2) {
+  display: none;
+}
+.mp-own {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #ffd23a;
+}
