@@ -73,7 +73,7 @@ const PILOT_HEAD = 4.95;
 export const SPECS: Record<Kind, Spec> = {
   // A flag's gun turret (multiplayer): its model is built from shapes (turret.ts), the cannon is a gatling.
   turret: {
-    name: "Турель", hp: 150, speed: 0, radius: 1.6, score: 0, drop: 0, want: 0, range: 70,
+    name: "Турель", hp: 120, speed: 0, radius: 1.6, score: 0, drop: 0, want: 0, range: 70,
     dmg: 4, bulletSpeed: 70, burst: 5, cooldown: [1.2, 1.8], shot: "bolt", hit: [[2.4, 1.3], [0.8, 1.5]],
     rig: { model: "Hero", scale: 1, gait: null, death: null, attack: null, hit: null, gatling: { at: [0, 0.2, 0.9], size: 1.3 } },
     turret: true,

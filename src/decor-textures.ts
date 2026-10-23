@@ -299,6 +299,49 @@ export function riverText(scene: Scene) {
   return tex;
 }
 
+/** Creepers hanging down a wall: a dozen strands of leaves, thinning out towards the bottom. */
+export function vineTexture(scene: Scene) {
+  const W = 256, H = 512;
+  const tex = new DynamicTexture("vines", { width: W, height: H }, scene, true);
+  const c = tex.getContext() as unknown as CanvasRenderingContext2D;
+  c.clearRect(0, 0, W, H);
+  for (let s = 0; s < 12; s++) {
+    let x = 10 + rand() * (W - 20);
+    const len = H * (0.45 + rand() * 0.55);
+    c.strokeStyle = "#2c4a1c";
+    c.lineWidth = 2;
+    c.beginPath();
+    c.moveTo(x, 0);
+    for (let y = 0; y < len; y += 8) {
+      x += (rand() - 0.5) * 6;
+      c.lineTo(x, y);
+      if (rand() < 0.75) {
+        // A leaf either side, darker and fewer lower down.
+        c.fillStyle = ["#3f7a26", "#4f8f2e", "#2f6a20", "#5c9a34"][Math.floor(rand() * 4)];
+        c.globalAlpha = 1 - (y / len) * 0.4;
+        c.beginPath();
+        c.ellipse(x + (rand() < 0.5 ? -6 : 6), y, 7, 4, rand() * 3, 0, Math.PI * 2);
+        c.fill();
+        c.globalAlpha = 1;
+        c.beginPath();
+        c.moveTo(x, y);
+      }
+    }
+    c.stroke();
+  }
+  // A mat of leaves along the top, where the creepers hold on.
+  for (let i = 0; i < 90; i++) {
+    c.fillStyle = ["#3f7a26", "#2f6a20", "#4f8f2e"][i % 3];
+    c.beginPath();
+    c.ellipse(rand() * W, rand() * 26, 9, 6, rand() * 3, 0, Math.PI * 2);
+    c.fill();
+  }
+  tex.hasAlpha = true;
+  tex.update();
+  tex.wrapU = tex.wrapV = Texture.CLAMP_ADDRESSMODE;
+  return tex;
+}
+
 const SIGNS: [string, string][] = [
   ["РЕМОНТ РОБОТОВ", "#3ee8ff"],
   ["БАР «ОРБИТА»", "#ff3bd0"],

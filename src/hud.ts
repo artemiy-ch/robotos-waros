@@ -1,5 +1,7 @@
 import { SKINS, type Skin } from "./skins";
 import { PRIMARIES, PRIMARY_LIST, type Primary } from "./primary";
+import { MAP_BLURBS, MAP_LIST, MAP_NAMES } from "./maps";
+import type { MapName } from "../shared/mp";
 import { HALF, SIZE, type City } from "./city";
 import type { Game } from "./game";
 import { SPECIALS } from "./player";
@@ -100,6 +102,22 @@ export class Hud {
   private modeButtons: HTMLButtonElement[] = [];
   private onMode: (mode: "solo" | "mp") => void = () => {};
 
+  /** The map cards on the start screen (the Moon only for the single-player game). */
+  setupMaps(current: MapName, onChange: (m: MapName) => void) {
+    const box = byId("maps");
+    box.innerHTML = MAP_LIST.map((m) => `<button type="button" class="map" data-map="${m}"><strong>${MAP_NAMES[m]}</strong><small>${MAP_BLURBS[m]}</small></button>`).join("");
+    const buttons = [...box.querySelectorAll<HTMLButtonElement>(".map")];
+    const select = (m: MapName) => buttons.forEach((b) => b.classList.toggle("selected", b.dataset.map === m));
+    select(current);
+    for (const b of buttons) {
+      b.addEventListener("click", () => {
+        const m = b.dataset.map as MapName;
+        select(m);
+        onChange(m);
+      });
+    }
+  }
+
   /** The starting weapon cards: name, a line about it, damage / range / rate as pips. */
   setupWeapons(current: Primary, onChange: (w: Primary) => void) {
     const box = byId("weapons");
@@ -141,6 +159,7 @@ export class Hud {
 
   pickMode(mode: "solo" | "mp", code?: string) {
     for (const b of this.modeButtons) b.classList.toggle("selected", b.dataset.mode === mode);
+
     byId("mp-menu").classList.toggle("hidden", mode !== "mp");
     if (code) byId<HTMLInputElement>("mp-code").value = code.toUpperCase();
     this.onMode(mode);

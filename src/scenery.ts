@@ -16,12 +16,34 @@ import {
   VertexBuffer,
 } from "@babylonjs/core";
 import { BLOCK, BLOCKS, HALF, ROAD, SIZE, STEP, crossing, rng, type Box, type Building, type City, type Theme } from "./city";
+import { vineTexture } from "./decor-textures";
+import { FLAGS, MAP_SPAN, basesFor, crossingXZ, spanEdges } from "../shared/mp";
+
+/** The flood's islands: their top (dry, above the water) and where they are: [x, z, radius]. */
+export const ISLAND_TOP = 3.3;
+export function floodIslands(): [number, number, number][] {
+  // On every flag on a crossing and every base, and on a handful of other crossings.
+  const spots: [number, number, number][] = [...FLAGS.filter((f) => !f.y).map((f) => f.at), ...basesFor("flood")].map(([x, z]) => [x, z, 14]);
+  const rand = rng(31337);
+  for (let tries = 0; spots.length < 15 && tries < 200; tries++) {
+    const [x, z] = crossingXZ(Math.floor(rand() * (BLOCKS + 1)), Math.floor(rand() * (BLOCKS + 1)));
+    if (spots.every(([sx, sz]) => Math.hypot(sx - x, sz - z) > 60)) spots.push([x, z, 8 + rand() * 4]);
+  }
+  return spots;
+}
+
+/** Whether (x, z) is on one of the flood's islands. */
+export function onIsland(x: number, z: number) {
+  return floodIslands().some(([ix, iz, r]) => Math.hypot(ix - x, iz - z) < r * 0.85);
+}
 import { GRAFFITI_CELLS, SIGN_CELLS, SPERDALYAY, beamTexture, bearMural, graffitiAtlas, padTexture, riverText, signAtlas, solarTexture } from "./decor-textures";
 import type { Fx } from "./fx";
 import { VEHICLES, type Models, type VehicleName } from "./models";
 import { mat } from "./util";
 
 const CARS = 46;
+/** How high the water stands on the flooded map. */
+export const WATER_LEVEL = 2.6;
 const BURNING = 6;
 const BARRICADES = 8;
 /** The player starts here, looking along +Z. */
@@ -113,6 +135,16 @@ export class Scenery {
   private decalCheck = 0;
   /** The wall with the bear mural on it, kept clear of other paint and signs. */
   private mural: { b: Building; side: number } | null;
+  /** The jungle map's trees, creepers and undergrowth, with the trees' trunks to bump into; the flood's water. */
+  private jungle: Mesh[] = [];
+  private jungleBoxes: Box[] = [];
+  private water: Mesh | null = null;
+  private islands: Mesh[] = [];
+  private islandBoxes: Box[] = [];
+  private muralMesh: Mesh | null = null;
+  /** Wall pictures hidden for now (above where a ruin breaks off). */
+  private hiddenDecals: WallDecal[] = [];
+  private map: "city" | "jungle" | "flood" = "city";
 
   constructor(
     private scene: Scene,
@@ -146,6 +178,225 @@ export class Scenery {
     if (this.theme) for (const b of this.theme === "earth" ? this.earthBoxes : this.moonBoxes) this.city.removeObstacle(b);
     this.city.addObstacles(earth ? this.earthBoxes : this.moonBoxes);
     this.theme = theme;
+  }
+
+  /** Buildings that must stay whole on the jungle map: the mural's and the searchlights'. */
+  keepWhole(): [number, number][] {
+    const spots: [number, number][] = this.lights.map((l) => [l.node.position.x, l.node.position.z]);
+    if (this.mural) spots.push([this.mural.b.cx, this.mural.b.cz]);
+    return spots;
+  }
+
+  /** The dressing for a map on the Earth layout: jungle growth, flood water, or neither. */
+  setMap(map: "city" | "jungle" | "flood") {
+    if (map === this.map) return;
+    if (this.map === "jungle") {
+      for (const b of this.jungleBoxes) this.city.removeObstacle(b);
+      for (const d of this.hiddenDecals) d.mesh.thinInstanceSetMatrixAt(d.index, d.shown ? d.matrix : Matrix.Scaling(0, 0, 0), true);
+      this.hiddenDecals = [];
+    }
+    if (map === "jungle") {
+      if (!this.jungle.length) this.buildJungle();
+      this.city.addObstacles(this.jungleBoxes);
+      // Paint above where a ruin breaks off has nothing to hang on.
+      for (const d of this.decals) {
+        if (d.matrix.getTranslation().y + 1.5 < d.building.box.h) continue;
+        d.mesh.thinInstanceSetMatrixAt(d.index, Matrix.Scaling(0, 0, 0), true);
+        this.hiddenDecals.push(d);
+      }
+    }
+    if (this.map === "flood") for (const b of this.islandBoxes) this.city.removeObstacle(b);
+    if (map === "flood") {
+      this.water ??= this.buildWater();
+      if (!this.islands.length) this.buildIslands();
+      this.city.addObstacles(this.islandBoxes);
+    }
+    for (const m of this.jungle) m.setEnabled(map === "jungle");
+    this.water?.setEnabled(map === "flood");
+    for (const m of this.islands) m.setEnabled(map === "flood");
+    // No bear on the flooded map.
+    this.muralMesh?.setEnabled(map !== "flood");
+    this.map = map;
+  }
+
+  /** Trees along the pavements and in the parks, creepers down the walls, undergrowth in the streets. */
+  private buildJungle() {
+    const scene = this.scene, rand = rng(777);
+    // A jungle tree: a tall bare trunk and a broad canopy of three flattened clumps.
+    const trunk = MeshBuilder.CreateCylinder("jungleTrunk", { height: 1, diameterTop: 0.5, diameterBottom: 0.9, tessellation: 7 }, scene);
+    trunk.bakeTransformIntoVertices(Matrix.Scaling(1, 12, 1).multiply(Matrix.Translation(0, 6, 0)));
+    trunk.material = mat(scene, "jungleBark", "#3b2c1f");
+    const clumps = [[0, 12.5, 0, 6], [-2.2, 11.2, 1.4, 4.5], [2.1, 11.6, -1.2, 4.8]].map(([x, y, z, d]) => {
+      const c = MeshBuilder.CreateSphere("jungleLeaves", { diameter: d, segments: 6 }, scene);
+      c.scaling.y = 0.55;
+      c.position.set(x, y, z);
+      return c;
+    });
+    const canopy = Mesh.MergeMeshes(clumps, true)!;
+    canopy.convertToFlatShadedMesh();
+    canopy.material = mat(scene, "jungleLeaves", "#2f5d22");
+    const trees: Matrix[] = [];
+    const plant = (x: number, z: number, s: number) => {
+      trees.push(Matrix.Compose(new Vector3(s, s, s), Quaternion.RotationAxis(Vector3.Up(), rand() * 6.3), new Vector3(x, 0, z)));
+      this.jungleBoxes.push({ minX: x - 0.5, maxX: x + 0.5, minZ: z - 0.5, maxZ: z + 0.5, h: 12 * s });
+    };
+    // Along the edges of every block, a metre in from the kerb; more in the parks.
+    for (let i = 0; i < BLOCKS; i++) {
+      for (let j = 0; j < BLOCKS; j++) {
+        const x0 = -HALF + ROAD + i * STEP, z0 = -HALF + ROAD + j * STEP;
+        const park = this.city.parks.some((p) => Math.abs(p.x - (x0 + BLOCK / 2)) < 1 && Math.abs(p.z - (z0 + BLOCK / 2)) < 1);
+        for (let t = 3; t < BLOCK - 2; t += 8) {
+          for (const [x, z] of [[x0 + t, z0 + 1], [x0 + t, z0 + BLOCK - 1], [x0 + 1, z0 + t], [x0 + BLOCK - 1, z0 + t]]) {
+            if (rand() < (park ? 0.5 : 0.26)) plant(x + (rand() - 0.5) * 2, z + (rand() - 0.5) * 2, 0.8 + rand() * 0.5);
+          }
+        }
+        if (park) for (let k = 0; k < 4; k++) plant(x0 + 6 + rand() * (BLOCK - 12), z0 + 6 + rand() * (BLOCK - 12), 1 + rand() * 0.4);
+      }
+    }
+    // The lots the jungle took back grow trees of their own.
+    const [lo, hi] = MAP_SPAN.jungle;
+    const [edgeA, edgeB] = spanEdges("jungle");
+    for (const b of this.city.buildings) {
+      if (!b.overgrown || b.cx < edgeA || b.cx > edgeB || b.cz < edgeA || b.cz > edgeB) continue;
+      for (let k = 0; k < 2 + Math.floor(rand() * 4); k++) plant(b.cx + (rand() - 0.5) * (b.w - 2), b.cz + (rand() - 0.5) * (b.d - 2), 0.9 + rand() * 0.6);
+    }
+    // A few streets grown shut, so the way round is different: never next to a flag or a base.
+    const keepClear = [...FLAGS.filter((f) => !f.y).map((f) => f.at), ...basesFor("jungle")];
+    let shut = 0;
+    for (let tries = 0; shut < 7 && tries < 200; tries++) {
+      const i = lo + Math.floor(rand() * (hi - lo + 1)), j = lo + Math.floor(rand() * (hi - lo));
+      const alongZ = rand() < 0.5;
+      const [ax, az] = alongZ ? crossingXZ(i, j) : crossingXZ(j, i);
+      const [bx, bz] = alongZ ? crossingXZ(i, j + 1) : crossingXZ(j + 1, i);
+      if (keepClear.some(([x, z]) => Math.hypot(x - ax, z - az) < 1 || Math.hypot(x - bx, z - bz) < 1)) continue;
+      const mx = (ax + bx) / 2, mz = (az + bz) / 2;
+      for (const off of [-5, -1.7, 1.7, 5]) {
+        const jitter = (rand() - 0.5) * 6;
+        plant(alongZ ? mx + off : mx + jitter, alongZ ? mz + jitter : mz + off, 1 + rand() * 0.4);
+      }
+      shut++;
+    }
+    // The forest wall: big trees all along the edge of the play area, just outside it.
+    for (const edge of [edgeA - 4, edgeB + 4]) {
+      for (let t = edgeA - 4; t <= edgeB + 4; t += 6) {
+        plant(edge + (rand() - 0.5) * 3, t, 1.6 + rand() * 0.8);
+        plant(t, edge + (rand() - 0.5) * 3, 1.6 + rand() * 0.8);
+      }
+    }
+    // Clear of the crossings (where the flags stand) and anything already there.
+    const clear = (b: Box) => !this.city.boxes.some((o) => o.building && overlaps(o, b, 0.5)) && !this.earthBoxes.some((o) => overlaps(o, b, 0.5));
+    const kept: Matrix[] = [];
+    const boxes: Box[] = [];
+    trees.forEach((m, i) => (clear(this.jungleBoxes[i]) ? (kept.push(m), boxes.push(this.jungleBoxes[i])) : null));
+    this.jungleBoxes = boxes;
+    this.jungle.push(thin(trunk, kept, this.shadows), thin(canopy, kept, this.shadows));
+    this.giantTrees(rand);
+
+    // Undergrowth: low clumps of leaves all over the streets and pavements, nothing to stop on.
+    const bush = MeshBuilder.CreateIcoSphere("jungleBush", { radius: 1, subdivisions: 1 }, scene);
+    bush.scaling.y = 0.5;
+    bush.bakeCurrentTransformIntoVertices();
+    bush.convertToFlatShadedMesh();
+    bush.material = mat(scene, "jungleBush", "#355f25");
+    const bushes: Matrix[] = [];
+    for (let k = 0; k < 420; k++) {
+      const x = (rand() - 0.5) * (SIZE - 10), z = (rand() - 0.5) * (SIZE - 10), s = 0.6 + rand() * 1.4;
+      if (this.city.boxes.some((o) => o.building && x > o.minX - 1 && x < o.maxX + 1 && z > o.minZ - 1 && z < o.maxZ + 1)) continue;
+      bushes.push(Matrix.Compose(new Vector3(s, s, s), Quaternion.RotationAxis(Vector3.Up(), rand() * 6.3), new Vector3(x, 0, z)));
+    }
+    const undergrowth = thin(bush, bushes);
+    undergrowth.receiveShadows = true;
+    this.jungle.push(undergrowth);
+
+    // Creepers down the walls of half the buildings, hanging from the top (of the ruin, if broken).
+    const vines = MeshBuilder.CreatePlane("vines", { size: 1 }, scene);
+    const vm = new StandardMaterial("vines", scene);
+    vm.diffuseTexture = vineTexture(scene);
+    vm.diffuseTexture.hasAlpha = true;
+    vm.specularColor = Color3.Black();
+    vm.backFaceCulling = false;
+    vm.zOffset = -1;
+    vines.material = vm;
+    const hangs: Matrix[] = [];
+    for (const b of this.city.buildings) {
+      if (rand() > 0.55) continue;
+      for (let k = 0; k < 1 + Math.floor(rand() * 3); k++) {
+        const side = Math.floor(rand() * 4), h = b.box.h * (0.35 + rand() * 0.45), w = 4 + rand() * 5;
+        hangs.push(onWall(b, side, 0.15 + rand() * 0.7, b.box.h - h / 2, w, h, 0.1));
+      }
+    }
+    this.jungle.push(thin(vines, hangs));
+    for (const m of this.jungle) m.setEnabled(false);
+  }
+
+  /**
+   * Two or three giant trees towering over the ruins, in the parks (or the biggest lost lots) of the
+   * play area: a trunk to hide behind and a canopy forty metres up.
+   */
+  private giantTrees(rand: () => number) {
+    const scene = this.scene;
+    const [a, b] = spanEdges("jungle");
+    const inside = (x: number, z: number) => x > a + 10 && x < b - 10 && z > a + 10 && z < b - 10;
+    const spots = this.city.parks.filter((p) => inside(p.x, p.z)).map((p) => [p.x, p.z] as [number, number]);
+    for (const bd of [...this.city.buildings].sort((x, y) => y.w * y.d - x.w * x.d)) {
+      if (spots.length >= 3) break;
+      if (bd.overgrown && inside(bd.cx, bd.cz) && spots.every(([x, z]) => Math.hypot(x - bd.cx, z - bd.cz) > 60)) spots.push([bd.cx, bd.cz]);
+    }
+    const trunk = MeshBuilder.CreateCylinder("giantTrunk", { height: 46, diameterTop: 2.4, diameterBottom: 4.2, tessellation: 10 }, scene);
+    trunk.bakeTransformIntoVertices(Matrix.Translation(0, 23, 0));
+    trunk.material = mat(scene, "giantBark", "#4a3622");
+    const clumps = [[0, 44, 0, 20], [-9, 40, 4, 15], [8, 41, -6, 16], [3, 38, 9, 13], [-5, 39, -9, 13]].map(([x, y, z, d]) => {
+      const c = MeshBuilder.CreateSphere("giantLeaves", { diameter: d, segments: 7 }, scene);
+      c.scaling.y = 0.5;
+      c.position.set(x, y, z);
+      return c;
+    });
+    const canopy = Mesh.MergeMeshes(clumps, true)!;
+    canopy.convertToFlatShadedMesh();
+    canopy.material = mat(scene, "giantLeaves", "#28561c");
+    const at = spots.slice(0, 3).map(([x, z]) => Matrix.Compose(Vector3.One(), Quaternion.RotationAxis(Vector3.Up(), rand() * 6.3), new Vector3(x, 0, z)));
+    for (const [x, z] of spots.slice(0, 3)) this.jungleBoxes.push({ minX: x - 2, maxX: x + 2, minZ: z - 2, maxZ: z + 2, h: 46 });
+    this.jungle.push(thin(trunk, at, this.shadows), thin(canopy, at, this.shadows));
+  }
+
+  /** The flood: murky water over the streets, up to a robot's knees and more. */
+  /** Sandy islands with a grassy top, standing out of the flood; their tops can be stood on. */
+  private buildIslands() {
+    const scene = this.scene;
+    const sand = mat(scene, "islandSand", "#b8a074");
+    const grass = mat(scene, "islandGrass", "#4f7a3a");
+    for (const [x, z, r] of floodIslands()) {
+      const body = MeshBuilder.CreateCylinder("island", { diameterTop: r * 2, diameterBottom: r * 2.3, height: 6, tessellation: 10 }, scene);
+      body.position.set(x, ISLAND_TOP - 3, z);
+      body.material = sand;
+      const cap = MeshBuilder.CreateCylinder("islandGrass", { diameter: r * 1.7, height: 0.3, tessellation: 10 }, scene);
+      cap.position.set(x, ISLAND_TOP, z);
+      cap.material = grass;
+      for (const m of [body, cap]) {
+        m.isPickable = false;
+        m.receiveShadows = true;
+        this.shadows.addShadowCaster(m);
+        m.setEnabled(false);
+        this.islands.push(m);
+      }
+      const half = r * 0.88;
+      this.islandBoxes.push({ minX: x - half, maxX: x + half, minZ: z - half, maxZ: z + half, h: ISLAND_TOP, floor: true });
+    }
+  }
+
+  private buildWater() {
+    const water = MeshBuilder.CreateGround("water", { width: SIZE + 600, height: SIZE + 600 }, this.scene);
+    water.position.y = WATER_LEVEL;
+    const m = new StandardMaterial("water", this.scene);
+    m.diffuseColor = Color3.FromHexString("#0e2a30");
+    m.emissiveColor = Color3.FromHexString("#020b0d");
+    m.specularColor = new Color3(0.45, 0.5, 0.55);
+    m.specularPower = 128;
+    m.alpha = 0.9;
+    water.material = m;
+    water.isPickable = false;
+    water.receiveShadows = true;
+    return water;
   }
 
   // ---- Earth ----
@@ -477,7 +728,7 @@ export class Scenery {
       m.emissiveColor = new Color3(0.25, 0.25, 0.25);
       m.specularColor = new Color3(0.05, 0.05, 0.05);
       m.zOffset = -2;
-      const plane = MeshBuilder.CreatePlane("bearMural", { size: 1 }, this.scene);
+      const plane = (this.muralMesh = MeshBuilder.CreatePlane("bearMural", { size: 1 }, this.scene));
       plane.material = m;
       const matrix = onWall(b, side, 0.5, 1 + h / 2, w, h, 0.07);
       thin(plane, [matrix]);

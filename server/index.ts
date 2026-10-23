@@ -34,8 +34,13 @@ import {
   CRATE_SPOTS,
   CRATES,
   FLAGS,
+  flagsFor,
   KILL_POINTS,
   MAX_PLAYERS,
+  MP_MAPS,
+  basesFor,
+  inSpan,
+  type MapName,
   PROTOCOL,
   RECAPTURE_TIME,
   ROUND_BREAK,
@@ -88,6 +93,9 @@ interface Room {
   host: number;
   /** Seconds until each tripped tripwire of the server's own is set again somewhere. */
   wireRespawns: number[];
+  /** The map this round is on, and whether it is the night round there (each map gets a day round, then a night one). */
+  map: MapName;
+  night: boolean;
   /** Seconds to this round's drop pod (below zero once it has come). */
   dropT: number;
 }
@@ -112,10 +120,10 @@ function newCode() {
 
 const freshFlags = (): FlagState[] => FLAGS.map(() => ({ owner: null, taker: null, progress: 0, contested: false, turret: WORLD }));
 
-function createRoom(): Room {
+function createRoom(map: MapName): Room {
   const room: Room = {
     code: newCode(), clients: new Map(), flags: freshFlags(), crates: [], respawns: [], income: 0, winner: null, breakT: 0, nextId: 1, nextCrate: 1,
-    items: [], itemRespawns: [], mines: [], nextItem: 1, nextMine: 1, host: 0, wireRespawns: [], dropT: DROP_AT,
+    items: [], itemRespawns: [], mines: [], nextItem: 1, nextMine: 1, host: 0, wireRespawns: [], dropT: DROP_AT, map, night: false,
   };
   for (let i = 0; i < WORLD_MINES; i++) addWorldMine(room, false);
   for (let i = 0; i < CRATES; i++) addCrate(room, false);
@@ -128,7 +136,8 @@ function createRoom(): Room {
 /** A crate somewhere on the streets, away from the flags, the bases and the other crates. */
 function addCrate(room: Room, announce: boolean) {
   const clear = (x: number, z: number) =>
-    [...FLAGS.map((f) => f.at), ...BASES].every(([fx, fz]) => Math.hypot(fx - x, fz - z) > 25) &&
+    inSpan(room.map, x, z) &&
+    [...flagsFor(room.map).map((f) => f.at), ...basesFor(room.map)].every(([fx, fz]) => Math.hypot(fx - x, fz - z) > 25) &&
     room.crates.every((c) => Math.hypot(c.x - x, c.z - z) > 40);
   let spot = CRATE_SPOTS[Math.floor(Math.random() * CRATE_SPOTS.length)];
   for (let tries = 0; tries < 50 && !clear(...spot); tries++) spot = CRATE_SPOTS[Math.floor(Math.random() * CRATE_SPOTS.length)];
@@ -143,7 +152,7 @@ function addCrate(room: Room, announce: boolean) {
 /** A coin or a tripwire kit somewhere in the streets, not on top of another. */
 function addItem(room: Room, kind: ItemInfo["kind"], announce: boolean) {
   // Coins anywhere, even up in the air and on roofs; tripwire kits in the streets.
-  const pick = (): [number, number, number] => (kind === "coin" ? coinSpot() : [...streetSpot(), 1.6]);
+  const pick = (): [number, number, number] => (kind === "coin" ? coinSpot(room.map) : [...streetSpot(room.map), 1.6]);
   let spot = pick();
   for (let tries = 0; tries < 30 && room.items.some((o) => Math.hypot(o.x - spot[0], o.z - spot[1], o.y - spot[2]) < 12); tries++) spot = pick();
   const item = { id: room.nextItem++, kind, x: spot[0], y: spot[2], z: spot[1] };
@@ -153,14 +162,36 @@ function addItem(room: Room, kind: ItemInfo["kind"], announce: boolean) {
 
 /** One of the server's own tripwires, near a random flag. */
 function addWorldMine(room: Room, announce: boolean) {
-  const [a, b] = worldWire(FLAGS[Math.floor(Math.random() * FLAGS.length)]);
+  const flags = flagsFor(room.map);
+  const [a, b] = worldWire(flags[Math.floor(Math.random() * flags.length)]);
   const mine = { id: room.nextMine++, owner: WORLD, a, b };
   room.mines.push(mine);
   if (announce) broadcast(room, { t: "mine", mine });
 }
 
 /** A fresh round: no winner, no flags held, nobody's points or tripwires (the server's own stay). */
-function newRound(room: Room) {
+/** A new map: the crates and items go and come back where they can be reached on it. */
+function reseed(room: Room) {
+  for (const c of room.crates) broadcast(room, { t: "taken", crate: c.id, by: 0 });
+  for (const it of room.items) broadcast(room, { t: "grabbed", item: it.id, by: 0, kind: it.kind });
+  room.crates = [];
+  room.items = [];
+  room.respawns = [];
+  room.itemRespawns = [];
+  for (let i = 0; i < CRATES; i++) addCrate(room, true);
+  for (let i = 0; i < COINS; i++) addItem(room, "coin", true);
+  for (let i = 0; i < WIRE_KITS; i++) addItem(room, "wire", true);
+}
+
+/** A fresh round; `next` moves on to the next map (after a win, not when a second player arrives). */
+function newRound(room: Room, next = false) {
+  // After a win: the same map by night, or after the night round the next map by day.
+  if (next && !room.night) room.night = true;
+  else if (next) {
+    room.night = false;
+    room.map = MP_MAPS[(MP_MAPS.indexOf(room.map) + 1) % MP_MAPS.length];
+    reseed(room);
+  }
   room.winner = null;
   room.dropT = DROP_AT;
   // Last round's pod, if nobody got it, goes.
@@ -170,7 +201,7 @@ function newRound(room: Room) {
   for (const c of room.clients.values()) c.info.score = c.info.kills = 0;
   for (const m of room.mines.filter((x) => x.owner !== WORLD)) broadcast(room, { t: "boom", mine: m.id, victim: null });
   room.mines = room.mines.filter((x) => x.owner === WORLD);
-  broadcast(room, { t: "round" });
+  broadcast(room, { t: "round", map: room.map, night: room.night });
 }
 
 const finite = (v: unknown): v is [number, number, number] => Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n));
@@ -192,7 +223,7 @@ function join(ws: WebSocket, msg: Extract<ClientMessage, { t: "join" }>): [Room,
       send(ws, { t: "nope" });
       return null;
     }
-  } else room = createRoom();
+  } else room = createRoom(MP_MAPS.includes(msg.map as MapName) ? (msg.map as MapName) : "city");
   if (room.clients.size >= MAX_PLAYERS) {
     send(ws, { t: "full" });
     return null;
@@ -202,7 +233,7 @@ function join(ws: WebSocket, msg: Extract<ClientMessage, { t: "join" }>): [Room,
   const client: Client = { ws, info, state: null, seen: 0 };
   room.clients.set(info.id, client);
   if (!room.clients.has(room.host)) room.host = info.id;
-  send(ws, { t: "welcome", host: room.host, id: info.id, room: room.code, players: [...room.clients.values()].map((c) => c.info), flags: room.flags, crates: room.crates, items: room.items, mines: room.mines, winner: room.winner });
+  send(ws, { t: "welcome", map: room.map, night: room.night, host: room.host, id: info.id, room: room.code, players: [...room.clients.values()].map((c) => c.info), flags: room.flags, crates: room.crates, items: room.items, mines: room.mines, winner: room.winner });
   broadcast(room, { t: "joined", player: info }, info.id);
   console.log(`${room.code}: ${info.nick} joined (${room.clients.size})`);
   // Someone to play against at last: the round so far was only practice.
@@ -353,7 +384,7 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
 
 /** Flags: one player alone in a zone takes it; two or more hold each other up. */
 function updateFlags(room: Room, dt: number) {
-  FLAGS.forEach((flag, i) => {
+  flagsFor(room.map).forEach((flag, i) => {
     const f = room.flags[i];
     const now = Date.now();
     const inside = [...room.clients.values()].filter((c) => {
@@ -363,7 +394,8 @@ function updateFlags(room: Room, dt: number) {
     f.contested = inside.length > 1;
     if (f.contested) return;
     const who = inside[0]?.info.id ?? null;
-    if (who === null || who === f.owner) {
+    // A turret that isn't yours holds the flag: bring it down first.
+    if (who === null || who === f.owner || (f.turret !== null && f.turret !== who)) {
       f.progress = Math.max(0, f.progress - dt / CAPTURE_TIME);
       if (f.progress === 0) f.taker = null;
       return;
@@ -386,7 +418,7 @@ function tick(room: Room, dt: number) {
   if (room.winner !== null) {
     room.breakT -= dt;
     if (room.breakT <= 0) {
-      newRound(room);
+      newRound(room, true);
     }
   } else {
     updateFlags(room, dt);
@@ -410,7 +442,7 @@ function tick(room: Room, dt: number) {
   if (room.dropT > 0 && room.winner === null) {
     room.dropT -= dt;
     if (room.dropT <= 0) {
-      const [x, z] = streetSpot();
+      const [x, z] = streetSpot(room.map);
       const crate = { id: room.nextCrate++, x, z, weapon: "minigun" as const, drop: true };
       room.crates.push(crate);
       broadcast(room, { t: "crate", crate });

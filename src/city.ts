@@ -14,6 +14,7 @@ import {
 } from "@babylonjs/core";
 import { clamp, mat } from "./util";
 import type { Shape } from "./shapes";
+import { spanEdges } from "../shared/mp";
 import { craterSpots, craters, lightsTexture, MOON_TINTS, moonBuilding, panelTexture } from "./moon";
 
 export type Theme = "earth" | "moon";
@@ -29,6 +30,8 @@ export interface Box {
   building?: Building;
   /** Its real outline, when the mesh doesn't fill the box (the Moon's round buildings). */
   shape?: Shape;
+  /** Can be stood on though it isn't a building (the flood's islands). */
+  floor?: boolean;
 }
 
 export interface Building {
@@ -47,6 +50,8 @@ export interface Building {
   hp: number;
   maxHp: number;
   standing: boolean;
+  /** Gone under the jungle (that map only): not standing, and not brought back by restore(). */
+  overgrown?: boolean;
   /** Thin-instance indices of the roof units on top. */
   roofUnits: number[];
 }
@@ -59,6 +64,18 @@ export const SIZE = BLOCKS * BLOCK + (BLOCKS + 1) * ROAD;
 export const HALF = SIZE / 2;
 /** The block a cruiser crashed into: no buildings there. */
 const CRASH_BLOCK = [5, 6];
+
+/** Building colours on the jungle map (mossy) and the flooded one (dark and wet). */
+const JUNGLE_TINTS = ["#5f6a52", "#4f5d4f", "#6b6450", "#55604c", "#6f7560", "#465246"].map((h) => Color3.FromHexString(h));
+/** The flood: sun-bleached seaside colours, gone streaky in the wet. */
+const FLOOD_TINTS = ["#5f8f8a", "#b0725e", "#b8995a", "#8e4d43", "#7c95a8", "#89a88d"].map((h) => Color3.FromHexString(h));
+/** The ground on each map of the Earth layout. */
+const VARIANT_LOOKS = {
+  city: { ground: "#26282c", sidewalk: "#5f6266", lawn: "#33472a", paint: "#a9a38c" },
+  // Sandy tracks instead of tarmac, packed earth for the pavements.
+  jungle: { ground: "#a68b5b", sidewalk: "#6b5a3e", lawn: "#3c5a24", paint: "#6f7a52" },
+  flood: { ground: "#1e2628", sidewalk: "#3b4448", lawn: "#2a3d26", paint: "#6d6a5c" },
+};
 
 export function rng(seed: number) {
   return () => {
@@ -159,6 +176,13 @@ export class City {
   private earthOnly: Mesh[] = [];
   private moonOnly: Mesh[] = [];
   private treeMatrices: Matrix[] = [];
+  /** Buildings standing as broken stumps (the jungle map), with the meshes they show meanwhile. */
+  private ruins: { b: Building; mesh: Mesh }[] = [];
+  /** The map the city is dressed for (on the Earth layout). */
+  variant: "city" | "jungle" | "flood" = "city";
+  /** The jungle's forest wall round its smaller play area: obstacles while that map is on. */
+  private wall: Box[] = [];
+  private dashMesh: Mesh | null = null;
 
   constructor(private scene: Scene, private shadows: ShadowGenerator) {
     const rand = rng(1337);
@@ -291,7 +315,7 @@ export class City {
         dashes.push(Matrix.RotationY(Math.PI / 2).multiply(Matrix.Translation(t, 0.03, c)));
       }
     }
-    const dash = MeshBuilder.CreateBox("dash", { width: 0.3, height: 0.04, depth: 3 }, scene);
+    const dash = (this.dashMesh = MeshBuilder.CreateBox("dash", { width: 0.3, height: 0.04, depth: 3 }, scene));
     dash.material = this.looks.paint = mat(scene, "paint", "#a9a38c");
     thin(dash, dashes);
     this.finish(dash);
@@ -357,7 +381,7 @@ export class City {
   floorAt(x: number, z: number, r: number, y: number) {
     let floor = 0;
     for (const b of this.boxes) {
-      if (!b.building) continue;
+      if (!b.building && !b.floor) continue;
       if (b.shape) {
         const h = b.shape.heightAt(x, z);
         if (h <= y + 0.6 && h > floor) floor = h;
@@ -449,11 +473,133 @@ export class City {
     for (const m of craters(scene, craterSpots())) this.moonOnly.push(m);
   }
 
+  /**
+   * Dresses the Earth city for a map: as it is, as overgrown ruins (the jungle: a share of the
+   * buildings broken off to stumps, everything mossy), or flooded (dark and wet). Buildings with a
+   * point of `keep` on them stay whole. The layout is the same on every map.
+   */
+  setVariant(map: "city" | "jungle" | "flood", keep: [number, number][] = []) {
+    if (map === this.variant) return;
+    this.unruin();
+    this.unovergrow();
+    this.variant = map;
+    if (map === "jungle") {
+      this.ruin(keep);
+      this.overgrow(keep);
+    }
+    this.dashMesh?.setEnabled(map !== "jungle");
+    const tints = map === "jungle" ? JUNGLE_TINTS : map === "flood" ? FLOOD_TINTS : this.tints;
+    this.materials.forEach((m, i) => (m.diffuseColor = tints[i]));
+    const looks = VARIANT_LOOKS[map];
+    for (const key of Object.keys(looks) as (keyof typeof looks)[]) if (this.looks[key]) this.looks[key].diffuseColor = Color3.FromHexString(looks[key]);
+    this.version++;
+  }
+
+  /** About a third of the taller buildings broken off at 40-70% of their height, the same ones every time. */
+  private ruin(keep: [number, number][]) {
+    const rand = rng(4242);
+    const tallest = [...this.buildings].sort((a, b) => b.h - a.h).slice(0, 6);
+    for (const b of this.buildings) {
+      const pick = rand(), k = 0.4 + rand() * 0.3;
+      if (!b.standing || b.h < 16 || pick > 0.33 || tallest.includes(b)) continue;
+      const { minX, maxX, minZ, maxZ } = b.box;
+      if (keep.some(([x, z]) => x > minX - 2 && x < maxX + 2 && z > minZ - 2 && z < maxZ + 2)) continue;
+      const h = b.h * k;
+      // A stump with a couple of slabs of broken wall leaning on top.
+      const parts = [MeshBuilder.CreateBox("ruin", { width: b.w, depth: b.d, height: h, faceUV: buildingUV(b.w, b.d, h), wrap: true }, this.scene)];
+      parts[0].position.set(b.cx, h / 2, b.cz);
+      for (let i = 0; i < 2; i++) {
+        const w = b.w * (0.3 + rand() * 0.3), d = b.d * (0.25 + rand() * 0.3), t = 2 + rand() * 4;
+        const chunk = MeshBuilder.CreateBox("ruinChunk", { width: w, depth: d, height: t }, this.scene);
+        chunk.position.set(b.cx + (rand() - 0.5) * (b.w - w), h + t / 2 - 0.6, b.cz + (rand() - 0.5) * (b.d - d));
+        chunk.rotation.set((rand() - 0.5) * 0.5, rand() * 3, (rand() - 0.5) * 0.5);
+        parts.push(chunk);
+      }
+      const mesh = Mesh.MergeMeshes(parts, true, true)!;
+      mesh.material = this.materials[b.tint];
+      this.finish(mesh, this.shadows);
+      b.mesh.setEnabled(false);
+      b.mesh = mesh;
+      b.box.h = h;
+      for (const i of b.roofUnits) this.roofMesh.thinInstanceSetMatrixAt(i, Matrix.Scaling(0, 0, 0), true);
+      this.ruins.push({ b, mesh });
+    }
+  }
+
+  /**
+   * The jungle takes back the city: everything outside its play area (a forest wall goes round
+   * that), and about half of what is left inside; buildings with a point of `keep` stay.
+   */
+  private overgrow(keep: [number, number][]) {
+    const rand = rng(9090);
+    const [a, b] = spanEdges("jungle");
+    for (const bd of this.buildings) {
+      const pick = rand();
+      if (!bd.standing) continue;
+      const { minX, maxX, minZ, maxZ } = bd.box;
+      if (keep.some(([x, z]) => x > minX - 2 && x < maxX + 2 && z > minZ - 2 && z < maxZ + 2)) continue;
+      const inside = bd.cx > a && bd.cx < b && bd.cz > a && bd.cz < b;
+      if (inside && (pick > 0.5 || this.ruins.some((r) => r.b === bd))) continue;
+      bd.standing = false;
+      bd.overgrown = true;
+      bd.mesh.setEnabled(false);
+      this.boxes.splice(this.boxes.indexOf(bd.box), 1);
+      for (const i of bd.roofUnits) this.roofMesh.thinInstanceSetMatrixAt(i, Matrix.Scaling(0, 0, 0), true);
+    }
+    // The wall: four slabs of forest from the edges of the play area out past the end of the city.
+    const far = HALF + 400, tall = 400;
+    this.wall = [
+      { minX: -far, maxX: a, minZ: -far, maxZ: far, h: tall },
+      { minX: b, maxX: far, minZ: -far, maxZ: far, h: tall },
+      { minX: a, maxX: b, minZ: -far, maxZ: a, h: tall },
+      { minX: a, maxX: b, minZ: b, maxZ: far, h: tall },
+    ];
+    this.boxes.push(...this.wall);
+    this.nav.reblock({ minX: -HALF, maxX: HALF, minZ: -HALF, maxZ: HALF, h: 0 }, this.boxes);
+  }
+
+  private unovergrow() {
+    for (const w of this.wall) this.boxes.splice(this.boxes.indexOf(w), 1);
+    this.wall = [];
+    let any = false;
+    for (const b of this.buildings) {
+      if (!b.overgrown) continue;
+      any = true;
+      b.overgrown = false;
+      b.standing = true;
+      b.mesh.setEnabled(true);
+      this.boxes.push(b.box);
+      for (const i of b.roofUnits) this.roofMesh.thinInstanceSetMatrixAt(i, this.roofMatrices[i], true);
+    }
+    if (any) this.nav.reblock({ minX: -HALF, maxX: HALF, minZ: -HALF, maxZ: HALF, h: 0 }, this.boxes);
+  }
+
+  private unruin() {
+    for (const { b, mesh } of this.ruins) {
+      mesh.dispose();
+      b.mesh = b.earthMesh;
+      b.box.h = b.h;
+      b.mesh.setEnabled(b.standing);
+      if (b.standing) for (const i of b.roofUnits) this.roofMesh.thinInstanceSetMatrixAt(i, this.roofMatrices[i], true);
+    }
+    this.ruins = [];
+  }
+
+  /** The top of the nearest building still standing: somewhere dry to stand (the flooded map). */
+  nearestRoof(x: number, z: number) {
+    let best: Building | null = null, bestD = Infinity;
+    for (const b of this.buildings) {
+      const d = Math.hypot(b.cx - x, b.cz - z);
+      if (b.standing && d < bestD) (bestD = d), (best = b);
+    }
+    return best ? new Vector3(best.cx, best.box.h, best.cz) : new Vector3(x, 0, z);
+  }
+
   /** Puts every building back as new (after a game over). */
   restore() {
     for (const b of this.buildings) {
       b.hp = b.maxHp;
-      if (b.standing) continue;
+      if (b.standing || b.overgrown) continue;
       b.standing = true;
       b.mesh.setEnabled(true);
       this.boxes.push(b.box);

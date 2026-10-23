@@ -11,7 +11,7 @@ import {
   UniversalCamera,
   Vector3,
 } from "@babylonjs/core";
-import type { ServerMessage } from "../shared/mp";
+import { FLAGS, MP_MAPS, type MapName, type ServerMessage } from "../shared/mp";
 import { Arena } from "./arena";
 import { BLOCKS, City, crossing, type Theme } from "./city";
 import { CrashSite } from "./crash";
@@ -32,7 +32,7 @@ import { Projectiles } from "./projectiles";
 import { BATTLE_TRACKS, Sfx } from "./sfx";
 import { BUSTER_EDGE, BUSTER_INTERVAL, Shawarma } from "./shawarma";
 import { SKINS, paintHero, type Skin } from "./skins";
-import { Scenery } from "./scenery";
+import { ISLAND_TOP, Scenery, WATER_LEVEL, onIsland } from "./scenery";
 import { Sky } from "./sky";
 import { offer, type Upgrade } from "./upgrades";
 import { Weather } from "./weather";
@@ -69,6 +69,9 @@ const FOV = 0.95;
 const FALL_SAFE = 15;
 const FALL_FATAL = 60;
 const FALL_MAX = 0.2;
+/** And by landing speed: a free fall of FALL_SAFE comes down at about the first, of FALL_FATAL at the second. */
+const IMPACT_SAFE = 28;
+const IMPACT_FATAL = 56;
 /** The tesla gun: a zap every TESLA_INTERVAL s at whatever is nearest the crosshair, jumping on to others nearby. */
 const TESLA_INTERVAL = 0.1;
 const TESLA_DAMAGE = 3.4;
@@ -92,8 +95,8 @@ interface Look {
   gravity: number;
 }
 /** Each world by day and by night; the light changes over every two waves. */
-const LOOKS: Record<Theme, { day: Look; night: Look }> = {
-  earth: {
+const LOOKS: Record<MapName, { day: Look; night: Look }> = {
+  city: {
     // A grey, smoggy day.
     day: {
       sky: new Color3(0.5, 0.55, 0.62), zenith: new Color3(0.24, 0.3, 0.42), fog: 0.0048, hemi: 0.8, hemiColor: new Color3(0.82, 0.86, 0.94), hemiGround: new Color3(0.2, 0.2, 0.22),
@@ -103,6 +106,28 @@ const LOOKS: Record<Theme, { day: Look; night: Look }> = {
     night: {
       sky: new Color3(0.13, 0.15, 0.2), zenith: new Color3(0.04, 0.05, 0.09), fog: 0.0062, hemi: 0.46, hemiColor: new Color3(0.5, 0.6, 0.88), hemiGround: new Color3(0.11, 0.11, 0.13),
       sun: 0.5, sunColor: new Color3(0.6, 0.7, 1), shadow: 0.35, gravity: 1,
+    },
+  },
+  // Overgrown ruins: green haze, warm sun through the steam.
+  jungle: {
+    day: {
+      sky: new Color3(0.46, 0.55, 0.42), zenith: new Color3(0.25, 0.36, 0.27), fog: 0.0072, hemi: 0.75, hemiColor: new Color3(0.75, 0.9, 0.7), hemiGround: new Color3(0.16, 0.2, 0.12),
+      sun: 1.1, sunColor: new Color3(1, 0.92, 0.7), shadow: 0.3, gravity: 1,
+    },
+    night: {
+      sky: new Color3(0.1, 0.14, 0.1), zenith: new Color3(0.03, 0.05, 0.03), fog: 0.008, hemi: 0.42, hemiColor: new Color3(0.45, 0.65, 0.5), hemiGround: new Color3(0.08, 0.1, 0.07),
+      sun: 0.45, sunColor: new Color3(0.6, 0.8, 0.7), shadow: 0.35, gravity: 1,
+    },
+  },
+  // The flooded city: grey rain light off the water.
+  flood: {
+    day: {
+      sky: new Color3(0.42, 0.48, 0.53), zenith: new Color3(0.22, 0.28, 0.36), fog: 0.0068, hemi: 0.72, hemiColor: new Color3(0.75, 0.82, 0.9), hemiGround: new Color3(0.12, 0.16, 0.18),
+      sun: 0.9, sunColor: new Color3(0.9, 0.92, 1), shadow: 0.25, gravity: 1,
+    },
+    night: {
+      sky: new Color3(0.1, 0.12, 0.16), zenith: new Color3(0.03, 0.04, 0.07), fog: 0.0072, hemi: 0.4, hemiColor: new Color3(0.45, 0.55, 0.8), hemiGround: new Color3(0.06, 0.07, 0.09),
+      sun: 0.45, sunColor: new Color3(0.6, 0.7, 1), shadow: 0.35, gravity: 1,
     },
   },
   moon: {
@@ -126,6 +151,9 @@ const isDay = (wave: number) => Math.floor((Math.max(1, wave) - 1) / 2) % 2 === 
 /** The minigun: seconds between rounds, and each round's damage against a machine-gun round. */
 const MINIGUN_INTERVAL = 0.025;
 const MINIGUN_DAMAGE = 1.1;
+
+/** Hull lost per second standing in the flood's water. */
+const RUST_DPS = 18;
 
 const SOLO_INVITE = "Город захвачен роботами";
 
@@ -311,6 +339,22 @@ export class Game {
         // Not remembered, then.
       }
     });
+    let savedMap: string | null = null;
+    try {
+      savedMap = localStorage.getItem("map");
+    } catch {
+      // No storage here.
+    }
+    this.startMap = ["city", "jungle", "flood", "moon"].includes(savedMap ?? "") ? (savedMap as MapName) : "city";
+    this.hud.setupMaps(this.startMap, (m) => {
+      this.startMap = m;
+      try {
+        localStorage.setItem("map", m);
+      } catch {
+        // Not remembered, then.
+      }
+      if (this.state === "menu" && !this.arena) this.reset();
+    });
     let weapon: string | null = null;
     try {
       weapon = localStorage.getItem("weapon");
@@ -345,18 +389,42 @@ export class Game {
     this.engine.runRenderLoop(() => this.frame());
   }
 
-  /** Repaints the whole world: city, sky, light, fog and gravity. */
-  private applyTheme(theme: Theme) {
+  /** Somewhere to stand out of the flood near (x, z): an island if there is one, or the nearest roof. */
+  dryLand(x: number, z: number) {
+    return onIsland(x, z) ? new Vector3(x, ISLAND_TOP, z) : this.city.nearestRoof(x, z);
+  }
+
+  /** The map being played, and the one picked on the start screen. */
+  map: MapName = "city";
+  private startMap: MapName = "city";
+
+  /**
+   * Puts the world on a map: the city's layout dressed as the city, the jungle ruins or the flood,
+   * or the Moon station; with its sky, light, fog and gravity. On the jungle map the buildings with a
+   * flag (or the mural, or a searchlight) on the roof stay whole.
+   */
+  applyMap(map: MapName) {
+    this.map = map;
+    const theme: Theme = map === "moon" ? "moon" : "earth";
+    if (theme === "moon") {
+      this.scenery?.setMap("city");
+      this.city.setVariant("city");
+    }
     this.city.setTheme(theme);
     this.scenery?.setTheme(theme);
-    this.sky.setTheme(theme, LOOKS[theme].day.sky);
+    if (map !== "moon") {
+      const keep = [...FLAGS.filter((f) => f.y).map((f) => f.at), ...(this.scenery?.keepWhole() ?? [])];
+      this.city.setVariant(map, keep);
+      this.scenery?.setMap(map);
+    }
+    this.sky.setTheme(theme, LOOKS[map].day.sky);
     this.weather.setEnabled(theme === "earth");
     this.applyLight(true);
   }
 
   /** Light, sky and fog for the current world at the current time of day; the reflections only when asked (they are slow to redo). */
   private applyLight(reflections: boolean) {
-    const looks = LOOKS[this.city.theme];
+    const looks = LOOKS[this.map];
     const look = mixLook(looks.night, looks.day, this.daylight);
     const scene = this.scene;
     this.sky.setColors(look.sky, look.zenith);
@@ -374,6 +442,14 @@ export class Game {
     this.sun.diffuse = look.sunColor;
     this.shadows.darkness = look.shadow;
     this.player.gravity = look.gravity;
+  }
+
+  /** Day or night as a room's round calls for: at once (on joining) or sliding there (between rounds). */
+  setNight(night: boolean, instant: boolean) {
+    this.dayTarget = night ? 0 : 1;
+    if (!instant) return;
+    this.daylight = this.dayTarget;
+    this.applyLight(true);
   }
 
   /** Dusk and dawn: the light slides towards the time of day the waves call for. */
@@ -397,7 +473,7 @@ export class Game {
   private reset() {
     this.daylight = this.dayTarget = isDay(START_WAVE) ? 1 : 0;
     // Starting past the first boss (when testing) means starting on the Moon.
-    this.applyTheme(START_WAVE > BOSS_EVERY ? "moon" : "earth");
+    this.applyMap(START_WAVE > BOSS_EVERY ? "moon" : this.startMap);
     this.warp = -1;
     this.hud.fade(0);
     this.enemies.clear();
@@ -410,7 +486,9 @@ export class Game {
     this.city.restore();
     this.props.reset();
     this.loot.reset();
-    this.player.respawn(crossing(BLOCKS / 2, BLOCKS / 2));
+    // Not in the water on the flooded map: on the nearest roof.
+    const start = crossing(BLOCKS / 2, BLOCKS / 2);
+    this.player.respawn(this.map === "flood" ? this.dryLand(start.x, start.z) : start);
     this.score = 0;
     this.wave = START_WAVE - 1;
     this.streak = this.streakT = 0;
@@ -480,7 +558,8 @@ export class Game {
         } else if (this.arena) this.leaveArena(reason);
       },
     ));
-    net.join(code, this.nick, this.skin);
+    // A new room starts on the map picked here.
+    net.join(code, this.nick, this.skin, MP_MAPS.includes(this.startMap) ? this.startMap : "city");
   }
 
   private onServer(net: Net, msg: ServerMessage) {
@@ -538,6 +617,7 @@ export class Game {
       this.sfx.laser(false);
       this.sfx.tesla(false);
       this.sfx.flameLoop(false);
+      this.sfx.minigun(false);
       if (this.arena)
         this.overlay("Пауза", `Бой продолжается — тебя могут сбить!<br><button type="button" id="mp-leave" class="mp-button">Выйти из комнаты</button>`);
       else this.overlay("Пауза", "");
@@ -643,9 +723,22 @@ export class Game {
       }
       player.landed = 0;
     }
+    // The flood: standing in the water rusts you, fast.
+    if (this.map === "flood" && player.alive && player.pos.y < WATER_LEVEL - 0.8) {
+      this.hurtPlayer(RUST_DPS * dt, "rust");
+      this.rustT -= dt;
+      if (this.rustT <= 0) {
+        this.rustT = 1.2;
+        this.hud.callout("Ржавеешь!");
+        this.sfx.rust();
+      }
+    } else this.rustT = 0;
     if (player.fell) {
       // The legs take the hit; the Moon's low gravity softens it.
-      const k = Math.min(1, Math.max(0, (player.fell - FALL_SAFE) / (FALL_FATAL - FALL_SAFE))) * player.gravity;
+      // As bad as the lesser of the drop and the speed: easing down on the jets from any height is safe.
+      const byHeight = (player.fell - FALL_SAFE) / (FALL_FATAL - FALL_SAFE);
+      const bySpeed = (player.impact - IMPACT_SAFE) / (IMPACT_FATAL - IMPACT_SAFE);
+      const k = Math.min(1, Math.max(0, Math.min(byHeight, bySpeed))) * player.gravity;
       if (k > 0) this.hurtPlayer(k * FALL_MAX * player.maxHp, "fall");
       player.fell = 0;
     }
@@ -739,7 +832,9 @@ export class Game {
   private updateMinigun(dt: number) {
     const p = this.player;
     this.miniT -= dt;
-    if (p.special !== "minigun" || !p.alive || !this.trigger) return;
+    const firing = p.special === "minigun" && p.alive && this.trigger;
+    this.sfx.minigun(firing);
+    if (!firing) return;
     while (this.miniT <= 0) {
       this.miniT += MINIGUN_INTERVAL * p.stats.fireInterval;
       this.miniGun = 1 - this.miniGun;
@@ -748,7 +843,6 @@ export class Game {
       const from = gun.muzzlePosition();
       const dir = gun.direction().addInPlaceFromFloats((Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06).normalize();
       this.projectiles.spawn(from, dir.scale(BULLET_SPEED), "tracer", p.stats.gunDamage * MINIGUN_DAMAGE);
-      if (this.miniGun) this.sfx.minigun();
     }
     this.miniT = Math.max(this.miniT, -0.05);
     this.shake = Math.min(this.shake + 0.02, 0.22);
@@ -845,7 +939,7 @@ export class Game {
       this.destruction.clear();
       this.fx.clearScorch();
       this.city.restore();
-      this.applyTheme("moon");
+      this.applyMap("moon");
       this.props.reset();
       this.loot.reset();
       this.player.teleport(crossing(BLOCKS / 2, BLOCKS / 2));
@@ -951,13 +1045,17 @@ export class Game {
     this.shake = Math.min(1, this.shake + amount * Math.max(0, 1 - dist / 80));
   }
 
-  hurtPlayer(dmg: number, cause: "enemy" | "fall" = "enemy") {
+  private rustT = 0;
+
+  hurtPlayer(dmg: number, cause: "enemy" | "fall" | "rust" = "enemy") {
     // In a room, other players can still hit you while the menu is up; not just after coming back, though.
     if ((this.state !== "playing" && !this.arena) || !this.player.alive || (this.arena?.guard ?? 0) > 0) return;
     this.deathCause = cause;
     const hadShield = this.player.shield > 0;
     const hull = this.player.takeHit(dmg, cause === "enemy");
-    if (hull > 0) {
+    if (cause === "rust") {
+      // Every frame in the water: no shaking about for it.
+    } else if (hull > 0) {
       this.hud.damage();
       this.sfx.hurt();
       this.shake = Math.min(1, this.shake + 0.3);
@@ -970,7 +1068,7 @@ export class Game {
     if (this.player.hp <= 0) this.die();
   }
 
-  private deathCause: "enemy" | "fall" = "enemy";
+  private deathCause: "enemy" | "fall" | "rust" = "enemy";
 
   private die() {
     if (this.arena) {
@@ -979,6 +1077,7 @@ export class Game {
       this.sfx.laser(false);
       this.sfx.tesla(false);
       this.sfx.flameLoop(false);
+      this.sfx.minigun(false);
       for (const b of this.beams) b.hide();
       this.player.die();
       setTimeout(() => {
@@ -996,6 +1095,7 @@ export class Game {
     this.sfx.laser(false);
     this.sfx.tesla(false);
     this.sfx.flameLoop(false);
+    this.sfx.minigun(false);
     for (const b of this.beams) b.hide();
     document.exitPointerLock();
     this.player.die();
@@ -1006,7 +1106,7 @@ export class Game {
       this.player.hide();
     }, 1100);
     setTimeout(() => {
-      const title = this.deathCause === "fall" ? "Едрить ты камикадзе" : "Робот уничтожен";
+      const title = this.deathCause === "fall" ? "Едрить ты камикадзе" : this.deathCause === "rust" ? "Заржавел" : "Робот уничтожен";
       this.overlay(title, `${this.nick ? `${escapeHtml(this.nick)} · ` : ""}Счёт: ${this.score} · Волна: ${this.wave}`, true);
     }, 2400);
   }
@@ -1022,6 +1122,7 @@ export class Game {
       this.sfx.laser(false);
       this.sfx.tesla(false);
       this.sfx.flameLoop(false);
+      this.sfx.minigun(false);
       for (const b of this.beams) b.hide();
       this.sfx.victory();
       document.exitPointerLock();

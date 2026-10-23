@@ -75,6 +75,8 @@ export class Player {
   landed = 0;
   /** How far the hero fell on the last landing, until the game has dealt with it. */
   fell = 0;
+  /** How fast it was coming down on that landing: a soft one on the jets hurts nothing, however high. */
+  impact = 0;
   /** Highest point of the current flight or fall. */
   private apex = 0;
   /** Counts footfalls; alternates the step sound between the feet. */
@@ -293,7 +295,10 @@ export class Player {
     if (wasAirborne) this.apex = Math.max(this.apex, this.pos.y);
     this.onGround = this.pos.y <= floor;
     if (this.onGround && wasAirborne && this.vy < -6) this.landed = -this.vy;
-    if (this.onGround && wasAirborne) this.fell = this.apex - floor;
+    if (this.onGround && wasAirborne) {
+      this.fell = this.apex - floor;
+      this.impact = -this.vy;
+    }
     if (this.onGround) this.diving = false;
     if (this.onGround) this.apex = floor;
     if (this.onGround) {

@@ -11,7 +11,35 @@ const HALF = (BLOCKS * BLOCK + (BLOCKS + 1) * ROAD) / 2;
 export const crossingXZ = (i: number, j: number): [number, number] => [-HALF + ROAD / 2 + i * STEP, -HALF + ROAD / 2 + j * STEP];
 
 /** Bumped whenever the messages or the rules change: a game and a server of different versions don't play together. */
-export const PROTOCOL = 10;
+export const PROTOCOL = 14;
+
+/**
+ * The maps: the city, its overgrown ruins in the jungle, the city flooded, and the Moon station.
+ * All four share the city's street grid; rooms go round them, two rounds on each: by day, then by night. The Moon's
+ * buildings are domes and towers, so its four roof flags stand on crossings instead (see flagsFor).
+ */
+export type MapName = "city" | "jungle" | "flood" | "moon";
+export const MP_MAPS: MapName[] = ["city", "jungle", "flood", "moon"];
+
+/** Which crossings each map's play area runs between: the jungle is the middle of the city, walled in by forest. */
+export const MAP_SPAN: Record<MapName, [number, number]> = { city: [0, BLOCKS], jungle: [1, BLOCKS - 1], flood: [0, BLOCKS], moon: [0, BLOCKS] };
+
+/** The edges of a map's play area (a square, the same along x and z). */
+export function spanEdges(map: MapName): [number, number] {
+  const [lo, hi] = MAP_SPAN[map];
+  return [crossingXZ(lo, lo)[0] - ROAD / 2, crossingXZ(hi, hi)[0] + ROAD / 2];
+}
+
+export function inSpan(map: MapName, x: number, z: number) {
+  const [a, b] = spanEdges(map);
+  return x > a && x < b && z > a && z < b;
+}
+
+/** Each player's home corner on a map, in order of joining. */
+export function basesFor(map: MapName) {
+  const [lo, hi] = MAP_SPAN[map];
+  return [crossingXZ(lo, lo), crossingXZ(hi, hi), crossingXZ(hi, lo), crossingXZ(lo, hi)];
+}
 
 export const MAX_PLAYERS = 4;
 /** Points to win: a held flag earns one a second, a kill earns KILL_POINTS. */
@@ -72,6 +100,15 @@ export const FLAGS: Flag[] = [
   { name: "H", at: [66.5, 66.5], y: 37.69, radius: 8.5 },
   { name: "I", at: [66.5, -83.5], y: 28.4, radius: 8.5 },
 ];
+
+/** On the Moon the roof flags F–I come down onto the crossings round the middle, a cross about A. */
+const MOON_CROSSINGS: [number, number][] = [[2, 4], [4, 2], [6, 4], [4, 6]];
+const MOON_FLAGS: Flag[] = FLAGS.map((f, i) => (f.y ? { ...f, at: crossingXZ(MOON_CROSSINGS[i - 5][0], MOON_CROSSINGS[i - 5][1]), y: 0, radius: 14 } : f));
+
+/** A map's flags (the same nine, by name; where they stand differs on the Moon). */
+export function flagsFor(map: MapName) {
+  return map === "moon" ? MOON_FLAGS : FLAGS;
+}
 
 /** Whether a robot at (x, y, z) is in a flag's zone: near it, and on its roof (or low over the crossing). */
 export function inZone(f: Flag, x: number, y: number, z: number) {
@@ -154,8 +191,9 @@ export function worldWire(f: Flag): [[number, number, number], [number, number, 
 }
 
 /** Somewhere on a street between two crossings, off the middle line. */
-export function streetSpot(): [number, number] {
-  const i = Math.floor(Math.random() * (BLOCKS + 1)), j = Math.floor(Math.random() * BLOCKS);
+export function streetSpot(map: MapName = "city"): [number, number] {
+  const [lo, hi] = MAP_SPAN[map];
+  const i = lo + Math.floor(Math.random() * (hi - lo + 1)), j = lo + Math.floor(Math.random() * (hi - lo));
   const [a, from] = crossingXZ(i, j);
   const along = from + ROAD / 2 + 2 + Math.random() * (STEP - ROAD - 4);
   const side = a + (Math.random() - 0.5) * (ROAD - 4);
@@ -163,11 +201,13 @@ export function streetSpot(): [number, number] {
 }
 
 /** Where a coin goes: in the street, up in the air over it, or on a roof. */
-export function coinSpot(): [number, number, number] {
-  const r = Math.random();
-  if (r < 0.4) return [...streetSpot(), 1.6];
-  if (r < 0.65) return [...streetSpot(), 8 + Math.random() * 22];
-  const [x, z, h, hw, hd] = ROOFS[Math.floor(Math.random() * ROOFS.length)];
+export function coinSpot(map: MapName = "city"): [number, number, number] {
+  // The jungle's roofs are mostly gone and the Moon's are domes: their coins are in the streets and up in the air.
+  const r = Math.random() * (map === "jungle" || map === "moon" ? 0.65 : 1);
+  if (r < 0.4) return [...streetSpot(map), 1.6];
+  if (r < 0.65) return [...streetSpot(map), 8 + Math.random() * 22];
+  const roofs = ROOFS.filter(([x, z]) => inSpan(map, x, z));
+  const [x, z, h, hw, hd] = roofs[Math.floor(Math.random() * roofs.length)];
   return [x + (Math.random() - 0.5) * Math.max(0, hw * 2 - 3), z + (Math.random() - 0.5) * Math.max(0, hd * 2 - 3), h + 1.6];
 }
 
@@ -251,7 +291,7 @@ export interface MineInfo {
 export type BotState = [number, string, number, number, number, number, number, number, number, number, number?];
 
 export type ClientMessage =
-  | { t: "join"; room: string | null; nick: string; skin: Skin; v: number }
+  | { t: "join"; room: string | null; nick: string; skin: Skin; v: number; map?: MapName }
   | { t: "state"; s: PilotState }
   | { t: "hit"; to: number; dmg: number; head?: boolean }
   | { t: "stun"; to: number; s: number }
@@ -270,7 +310,7 @@ export type ClientMessage =
   | { t: "look"; nick: string; skin: Skin };
 
 export type ServerMessage =
-  | { t: "welcome"; id: number; room: string; players: PlayerInfo[]; flags: FlagState[]; crates: CrateInfo[]; items: ItemInfo[]; mines: MineInfo[]; winner: number | null; host: number }
+  | { t: "welcome"; id: number; room: string; players: PlayerInfo[]; flags: FlagState[]; crates: CrateInfo[]; items: ItemInfo[]; mines: MineInfo[]; winner: number | null; host: number; map: MapName; night: boolean }
   | { t: "full" }
   | { t: "old" }
   | { t: "nope" }
@@ -295,4 +335,4 @@ export type ServerMessage =
   | { t: "bots"; list: BotState[] }
   | { t: "bothit"; from: number; bot: number; dmg: number }
   | { t: "win"; id: number }
-  | { t: "round" };
+  | { t: "round"; map: MapName; night: boolean };

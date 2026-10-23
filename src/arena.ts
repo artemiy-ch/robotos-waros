@@ -1,6 +1,6 @@
-import { Color3, Matrix, Mesh, MeshBuilder, Quaternion, StandardMaterial, Vector3 } from "@babylonjs/core";
+import { Color3, Matrix, Mesh, MeshBuilder, Quaternion, StandardMaterial, TransformNode, Vector3 } from "@babylonjs/core";
 import {
-  BASES,
+  basesFor,
   BOTS,
   WORLD,
   TURRET_COST,
@@ -17,7 +17,7 @@ import {
   type MineInfo,
   SPAWN_GUARD,
   inZone,
-  FLAGS,
+  flagsFor,
   RESPAWN_TIME,
   TARGET_SCORE,
   type FlagState,
@@ -31,6 +31,8 @@ import type { Net } from "./net";
 import { Player } from "./player";
 import { PRIMARY_LIST, type Primary } from "./primary";
 import { paintHero } from "./skins";
+import { MAP_NAMES } from "./maps";
+import { ISLAND_TOP, WATER_LEVEL } from "./scenery";
 import { NEUTRAL_TURRET, turretSpot } from "./turret";
 import { segSphere } from "./util";
 import { LaserBeam } from "./weapons";
@@ -48,7 +50,7 @@ const PLANT_REACH = 45;
 /** Bots: how many the host keeps going (more with more players), how often it adds one, how often it reports them. */
 const BOTS_BASE = 6;
 const BOTS_PER_PLAYER = 3;
-const BOTS_MAX = 18;
+const BOTS_MAX = 12;
 const BOT_SPAWN_EVERY = 2;
 const BOT_SEND = 0.1;
 
@@ -73,6 +75,8 @@ interface Remote {
 
 /** A flag in its zone: pole, cloth in the owner's colour, a ring round the zone, and a ring that fills as it is taken. */
 interface FlagView {
+  /** Everything of the flag hangs off this, raised onto the island on the flooded map. */
+  base: TransformNode;
   cloth: StandardMaterial;
   ring: StandardMaterial;
   progress: Mesh;
@@ -93,10 +97,14 @@ export class Arena {
   private flags: FlagState[];
   private views: FlagView[] = [];
   private flagMeshes: Mesh[] = [];
+  /** The flags' own meshes, rebuilt when the map (and so where the flags stand) changes. */
+  private flagParts: (Mesh | TransformNode)[] = [];
   winner: number | null;
   private sendT = 0;
   /** Who hit us last and when (and whether in the head): their kill if we go down soon after. */
   private lastHit: { id: number; t: number; head?: boolean } | null = null;
+  /** How loud the nearest other player's minigun is this frame (0: nobody firing one). */
+  private minigunVol = 0;
   /** Who has the price on their head now, and the beam of light over them. */
   private leader: number | null = null;
   private bountyBeam: Mesh | null = null;
@@ -144,7 +152,6 @@ export class Arena {
     this.board = this.ui.querySelector("#mp-board")!;
     this.capture = this.ui.querySelector("#mp-capture")!;
     this.feed = this.ui.querySelector("#mp-feed")!;
-    this.buildFlags();
     this.itemBases = this.buildItems();
     this.wireMat = this.glow("wire", "#ff3030", 0.55);
     this.ownWireMat = this.glow("ownWire", "#ff5a5a", 0.95);
@@ -156,6 +163,9 @@ export class Arena {
     for (const c of welcome.crates) g.loot.add(c);
     for (const it of welcome.items) this.addItem(it);
     for (const m of welcome.mines) this.addMine(m);
+    g.applyMap(welcome.map);
+    g.setNight(welcome.night, true);
+    this.buildFlags();
     // Our robot's trim in our colour, so the others can tell us apart.
     paintHero(g.player.mech, g.skin, this.color);
     this.home(false, true);
@@ -193,7 +203,7 @@ export class Arena {
     // Its own copies of the hero's paint, so its skin doesn't repaint everyone else.
     for (const m of player.mech.meshes) if (m.material) m.material = m.material.clone(m.material.name);
     paintHero(player.mech, info.skin, info.color);
-    const [x, z] = BASES[info.base];
+    const [x, z] = basesFor(this.g.map)[info.base];
     player.respawn(new Vector3(x, 0, z));
     g.enemies.addPilot(info.id, player.mech, player.pos, info.color);
     const tag = document.createElement("div");
@@ -223,13 +233,15 @@ export class Arena {
    */
   private home(keep = true, start = false) {
     let x: number, y = 0, z: number;
-    const ours = FLAGS.filter((_, i) => this.flags[i]?.owner === this.me);
-    if (start) [x, z] = BASES[this.mine.base];
+    const ours = this.mapFlags.filter((_, i) => this.flags[i]?.owner === this.me);
+    if (start) [x, z] = basesFor(this.g.map)[this.mine.base];
     else if (ours.length) {
       const f = ours[Math.floor(Math.random() * ours.length)];
       const a = Math.random() * Math.PI * 2, d = f.radius * 0.4;
       [x, z, y] = [f.at[0] + Math.cos(a) * d, f.at[1] + Math.sin(a) * d, f.y];
     } else [x, z] = streetSpot();
+    // Out of the water on the flooded map: up on the nearest roof.
+    if (this.g.map === "flood" && y < WATER_LEVEL) ({ x, y, z } = this.g.dryLand(x, z));
     const p = this.g.player;
     p.respawn(new Vector3(x, y, z), keep);
     this.guard = SPAWN_GUARD;
@@ -326,9 +338,9 @@ export class Arena {
       }
       case "captured":
         if (msg.by === this.me) {
-          g.hud.banner(`Флаг ${FLAGS[msg.flag].name} твой`, 2);
+          g.hud.banner(`Флаг ${this.mapFlags[msg.flag].name} твой`, 2);
           g.sfx.powerup();
-        } else this.log(`${this.colored(msg.by)} взял флаг ${FLAGS[msg.flag].name}`);
+        } else this.log(`${this.colored(msg.by)} взял флаг ${this.mapFlags[msg.flag].name}`);
         break;
       case "crate":
         g.loot.add(msg.crate, g);
@@ -357,13 +369,13 @@ export class Arena {
       }
       case "turretup":
         if (msg.by === this.me) {
-          g.hud.banner(`Твоя турель на флаге ${FLAGS[msg.flag].name}`, 2);
+          g.hud.banner(`Твоя турель на флаге ${this.mapFlags[msg.flag].name}`, 2);
           g.sfx.powerup();
-        } else this.log(`${this.colored(msg.by)} поставил турель на ${FLAGS[msg.flag].name}`);
+        } else this.log(`${this.colored(msg.by)} поставил турель на ${this.mapFlags[msg.flag].name}`);
         break;
       case "turretdown":
         if (msg.killer === this.me) g.hud.callout(`Турель разбита! +20`);
-        else if (msg.killer !== null) this.log(`${this.colored(msg.killer)} разбил турель на ${FLAGS[msg.flag].name}`);
+        else if (msg.killer !== null) this.log(`${this.colored(msg.killer)} разбил турель на ${this.mapFlags[msg.flag].name}`);
         break;
       case "item":
         this.addItem(msg.item);
@@ -385,7 +397,14 @@ export class Arena {
       case "round":
         this.winner = null;
         for (const info of this.infos.values()) info.score = info.kills = 0;
-        g.hud.banner("Новый раунд", 2);
+        // A new map: the host's turrets go up again where this one has them.
+        if (this.isHost && msg.map !== g.map) for (const e of g.enemies.list.filter((x) => x.kind === "turret" && x.remoteBot === undefined)) g.enemies.dropRemoteBot(e, g, true);
+        // A new map comes up by day straight away; the night round on the same map falls slowly.
+        const newMap = msg.map !== g.map;
+        g.applyMap(msg.map);
+        g.setNight(msg.night, newMap);
+        this.buildFlags();
+        g.hud.banner(`Новый раунд · ${MAP_NAMES[msg.map]} · ${msg.night ? "ночь" : "день"}`, 2.5);
         this.coinPoints = 0;
         this.home(false, true);
         break;
@@ -455,7 +474,9 @@ export class Arena {
       this.guard = shooting ? 0 : Math.max(0, this.guard - dt);
       g.player.mech.setFlash(this.guard > 0 && Math.sin(this.time * 18) > 0);
     }
+    this.minigunVol = 0;
     for (const r of this.remotes.values()) this.updateRemote(r, dt);
+    g.sfx.minigunFar(this.minigunVol);
     this.updateBounty();
     this.updateFlags();
     this.updateItems(dt);
@@ -513,8 +534,10 @@ export class Arena {
       }
       if (!e) {
         if (this.time - (this.turretGone.get(i) ?? -9) < 3) return;
-        const flag = FLAGS[i];
-        g.enemies.spawnTurret(i, turretSpot(flag.at, flag.y, flag.radius), f.turret, this.turretColor(f.turret));
+        const flag = this.mapFlags[i];
+        // On the flood a crossing's turret stands on its island.
+        const y = flag.y || (g.map === "flood" ? ISLAND_TOP : 0);
+        g.enemies.spawnTurret(i, turretSpot(flag.at, y, flag.radius), f.turret, this.turretColor(f.turret));
       } else if (e.turretOwner !== f.turret) g.enemies.setTurretOwner(e, f.turret, this.turretColor(f.turret));
     });
   }
@@ -522,7 +545,7 @@ export class Arena {
   /** B on our own flag with no turret: put up ours, if we have the points. */
   private buyTurret() {
     const g = this.g, p = g.player;
-    const here = FLAGS.findIndex((f) => inZone(f, p.pos.x, p.pos.y, p.pos.z));
+    const here = this.mapFlags.findIndex((f) => inZone(f, p.pos.x, p.pos.y, p.pos.z));
     const f = this.flags[here];
     if (!f || f.owner !== this.me || f.turret !== null) return;
     if (this.mine.score < TURRET_COST) return g.hud.banner(`Турель стоит ${TURRET_COST} очков`, 1.5);
@@ -861,17 +884,16 @@ export class Arena {
       const shot = p.fire(dt, true);
       if (shot) g.projectiles.spawn(shot.from, shot.dir.scale(BULLET_SPEED), "tracer", 0);
     }
-    // Their minigun, for show: the same forty rounds a second.
+    // Their minigun, for show: the same forty rounds a second (heard on one loop for all of them, see update()).
     r.miniT = (r.miniT ?? 0) - dt;
     if (firing && s.sp === "minigun") {
-      const near = Vector3.Distance(p.pos, g.player.pos);
+      this.minigunVol = Math.max(this.minigunVol, 1 - Vector3.Distance(p.pos, g.player.pos) / 150);
       while (r.miniT <= 0) {
         r.miniT += 0.025;
         r.gun = 1 - r.gun;
         const from = p.guns[r.gun].muzzlePosition();
         const dir = aim.subtract(from).normalize().addInPlaceFromFloats((Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06).normalize();
         g.projectiles.spawn(from, dir.scale(BULLET_SPEED), "tracer", 0);
-        if (r.gun) g.sfx.minigun(near);
       }
     } else r.miniT = Math.max(r.miniT, 0);
     const lasing = firing && s.sp === "laser";
@@ -905,7 +927,15 @@ export class Arena {
 
   // ---- Flags ----
 
+  /** This map's flags. */
+  private get mapFlags() {
+    return flagsFor(this.g.map);
+  }
+
   private buildFlags() {
+    for (const m of this.flagParts) m.dispose();
+    this.flagParts = [];
+    this.views = [];
     const scene = this.g.scene;
     const glowing = (name: string, alpha = 1) => {
       const m = new StandardMaterial(name, scene);
@@ -919,8 +949,8 @@ export class Arena {
     pole.material = new StandardMaterial("flagPole", scene);
     (pole.material as StandardMaterial).diffuseColor = new Color3(0.55, 0.57, 0.6);
     pole.setEnabled(false);
-    this.flagMeshes.push(pole);
-    FLAGS.forEach((flag, i) => {
+    this.flagParts.push(pole);
+    this.mapFlags.forEach((flag, i) => {
       const [x, z] = flag.at;
       // On a roof the pole stands to one side, clear of anything in the middle.
       const px = flag.y ? x + flag.radius * 0.5 : x;
@@ -941,9 +971,20 @@ export class Arena {
       progress.position.set(x, flag.y + 0.1, z);
       progress.material = progressMat;
       progress.setEnabled(false);
+      const base = new TransformNode(`flag${i}`, scene);
       for (const m of [clothMesh, ringMesh, progress]) m.isPickable = false;
-      this.flagMeshes.push(clothMesh, ringMesh, progress);
-      this.views.push({ cloth, ring, progress, progressMat, clothMesh });
+      for (const m of [p, clothMesh, ringMesh, progress]) m.parent = base;
+      this.flagParts.push(clothMesh, ringMesh, progress, base);
+      this.views.push({ base, cloth, ring, progress, progressMat, clothMesh });
+    });
+    this.placeFlags();
+  }
+
+  /** The flags on the crossings stand on their islands on the flooded map. */
+  placeFlags() {
+    this.mapFlags.forEach((flag, i) => {
+      const v = this.views[i];
+      if (v) v.base.position.y = !flag.y && this.g.map === "flood" ? ISLAND_TOP : 0;
     });
   }
 
@@ -993,7 +1034,7 @@ export class Arena {
       .map((f, i) => {
         const owner = f.owner === null ? NEUTRAL : this.infos.get(f.owner)?.color ?? NEUTRAL;
         const blink = (f.taker !== null && f.progress > 0) || f.contested ? " blink" : "";
-        return `<span class="mp-flag${blink}" style="border-color:${owner};color:${owner}">${FLAGS[i].name}</span>`;
+        return `<span class="mp-flag${blink}" style="border-color:${owner};color:${owner}">${this.mapFlags[i].name}</span>`;
       })
       .join("");
 
@@ -1016,14 +1057,15 @@ export class Arena {
 
     // Taking a flag: how far along, or that someone is in the way.
     const pos = g.player.pos;
-    const here = FLAGS.findIndex((f) => inZone(f, pos.x, pos.y, pos.z));
+    const here = this.mapFlags.findIndex((f) => inZone(f, pos.x, pos.y, pos.z));
     const f = here >= 0 ? this.flags[here] : null;
     let text = "";
     if (f && g.player.alive) {
-      const name = FLAGS[here].name;
+      const name = this.mapFlags[here].name;
       if (f.contested) text = `Флаг ${name} оспаривается!`;
       else if (f.owner === this.me)
         text = f.turret === null ? `Флаг ${name} твой · B — поставить турель (${TURRET_COST})` : `Флаг ${name} твой`;
+      else if (f.turret !== null && f.turret !== this.me) text = `Флаг ${name}: сначала разбей турель`;
       else if (f.taker === this.me) text = `Захват флага ${name}: ${Math.round(f.progress * 100)}%`;
       else text = `Захват флага ${name}…`;
     }
@@ -1078,13 +1120,13 @@ export class Arena {
     c.textAlign = "center";
     c.textBaseline = "middle";
     this.flags.forEach((f, i) => {
-      const [x, z] = FLAGS[i].at;
+      const [x, z] = this.mapFlags[i].at;
       c.fillStyle = f.owner === null ? NEUTRAL : this.infos.get(f.owner)?.color ?? NEUTRAL;
       c.beginPath();
       c.arc(px(x), pz(z), 7, 0, Math.PI * 2);
       c.fill();
       c.fillStyle = "#111";
-      c.fillText(FLAGS[i].name, px(x), pz(z) + 0.5);
+      c.fillText(this.mapFlags[i].name, px(x), pz(z) + 0.5);
     });
   }
 
@@ -1095,6 +1137,7 @@ export class Arena {
     this.preview.dispose();
     paintHero(this.g.player.mech, this.g.skin);
     for (const m of this.flagMeshes) m.dispose();
+    for (const m of this.flagParts) m.dispose();
     this.ui.remove();
     document.body.classList.remove("mp");
     this.net.close();

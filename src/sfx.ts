@@ -8,7 +8,7 @@ const MUSIC_VOLUME = 0.37;
 const CROSSFADE = 2.5;
 
 /** Recorded effects in public/sfx (generated with ElevenLabs Sound Effects). */
-const SAMPLES = ["gun", "rocket", "explosion", "explosion_big", "step_a", "step_b", "land", "laser", "powerup", "thunder_near", "thunder_far", "slam", "boss", "tesla", "warp", "victory", "shotgun", "rail", "flame"] as const;
+const SAMPLES = ["gun", "rocket", "explosion", "explosion_big", "step_a", "step_b", "land", "laser", "powerup", "thunder_near", "thunder_far", "slam", "boss", "tesla", "warp", "victory", "shotgun", "rail", "flame", "minigun"] as const;
 type Sample = (typeof SAMPLES)[number];
 
 /**
@@ -244,11 +244,22 @@ export class Sfx {
     this.burst(0.06, 4000, "highpass", 0.3 * v);
   }
 
-  /** The minigun: the cannon's crack pitched down, cut short, for forty rounds a second. */
-  minigun(dist = 0) {
-    const v = Math.max(0.05, 1 - dist / 120);
-    if (this.play("gun", 0.45 * v, 0.72 + Math.random() * 0.06, 0.09)) return;
-    this.burst(0.05, 1800, "highpass", 0.15 * v);
+  /**
+   * The minigun: one steady roar while it fires, not a sound per round (forty a second, grouped by
+   * frames, stutter). Ours, and the loudest of the other players' (by distance) on a second loop.
+   */
+  minigun(on: boolean) {
+    this.loop("minigun", on, 0.5);
+  }
+
+  minigunFar(vol: number) {
+    this.loop("minigun", vol > 0, vol * 0.5, "minigunFar");
+  }
+
+  /** Rusting in the flood: a wet fizz and a creak. */
+  rust() {
+    this.burst(0.4, 3000, "highpass", 0.12);
+    this.tone(140, 90, 0.35, "sawtooth", 0.05);
   }
 
   /** Our flamethrower's steady roar while it fires. */
@@ -355,13 +366,14 @@ export class Sfx {
     this.play("powerup", 0.8);
   }
 
-  private loops = new Map<Sample, GainNode>();
+  private loops = new Map<string, GainNode>();
 
   /** A sample looping for as long as `on` stays true (the laser's hum, the tesla's crackle). */
-  private loop(name: Sample, on: boolean, vol: number) {
+  /** A looping sample faded in or out; `key` lets the same sample run twice (ours and someone else's). */
+  private loop(name: Sample, on: boolean, vol: number, key: string = name) {
     const ctx = this.ctx, buffer = this.samples.get(name);
     if (!ctx || !buffer) return;
-    let gain = this.loops.get(name);
+    let gain = this.loops.get(key);
     if (!gain) {
       const src = ctx.createBufferSource();
       src.buffer = buffer;
@@ -373,7 +385,7 @@ export class Sfx {
       gain.gain.value = 0;
       src.connect(gain).connect(this.out);
       src.start(0, 0.05);
-      this.loops.set(name, gain);
+      this.loops.set(key, gain);
     }
     gain.gain.setTargetAtTime(on ? vol : 0, ctx.currentTime, 0.04);
   }

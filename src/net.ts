@@ -1,4 +1,4 @@
-import { PROTOCOL, type ClientMessage, type ServerMessage, type Skin } from "../shared/mp";
+import { PROTOCOL, type ClientMessage, type MapName, type ServerMessage, type Skin } from "../shared/mp";
 
 /** Where the multiplayer server is: VITE_MP_SERVER when built for the web, the local one in development. */
 export const SERVER_URL: string = import.meta.env.VITE_MP_SERVER ?? `ws://${location.hostname || "localhost"}:2567`;
@@ -34,8 +34,8 @@ export class Net {
   }
 
   /** Joins a room by code, or makes a new one (room null). */
-  join(room: string | null, nick: string, skin: Skin) {
-    const go = () => this.send({ t: "join", room, nick, skin, v: PROTOCOL });
+  join(room: string | null, nick: string, skin: Skin, map: MapName) {
+    const go = () => this.send({ t: "join", room, nick, skin, v: PROTOCOL, map });
     if (this.ws.readyState === WebSocket.OPEN) go();
     else this.ws.addEventListener("open", go, { once: true });
   }
