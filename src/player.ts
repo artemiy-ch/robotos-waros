@@ -24,12 +24,13 @@ const FUEL_REGEN_AIR = 0.08;
 const MOUSE_SENS = 0.0025;
 export const FIRE_INTERVAL = 0.07;
 const SPREAD = 0.015;
-export type Special = "laser" | "tesla" | "shawarma";
+export type Special = "laser" | "tesla" | "shawarma" | "minigun";
 /** Weapons from crates: full and short names, colour, and how many seconds each lasts. */
 export const SPECIALS: Record<Special, { name: string; short: string; color: string; time: number }> = {
   laser: { name: "Лазер", short: "Лазер", color: "#ff2a6d", time: 30 },
   tesla: { name: "Тесла-пушка", short: "Тесла", color: "#4aa8ff", time: 15 },
   shawarma: { name: "Шаурмбастер", short: "Шаурма", color: "#ffb347", time: 25 },
+  minigun: { name: "Шестистволка", short: "Шестистволка", color: "#ffd60a", time: 20 },
 };
 /** Q in the air: dive straight down at this speed. */
 const DIVE_SPEED = 48;
@@ -339,7 +340,7 @@ export class Player {
     this.guns.forEach((g, i) => {
       g.node.position.copyFrom(this.mech.bonePosition(i ? "hand.R" : "hand.L"));
       g.aimAt(aim, this.facing, 0.9);
-      g.update(dt, firing && this.alive && !this.special);
+      g.update(dt, firing && this.alive && (!this.special || this.special === "minigun"));
     });
     this.light.intensity *= Math.exp(-dt * 25);
 

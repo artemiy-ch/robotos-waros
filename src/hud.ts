@@ -1,4 +1,5 @@
 import { SKINS, type Skin } from "./skins";
+import { PRIMARIES, PRIMARY_LIST, type Primary } from "./primary";
 import { HALF, SIZE, type City } from "./city";
 import type { Game } from "./game";
 import { SPECIALS } from "./player";
@@ -80,12 +81,45 @@ export class Hud {
     this.overlay.addEventListener("click", fn);
   }
 
+  /** The big start button under the menus: its label, or hidden (null). */
+  startButton(label: string | null) {
+    const b = byId("start");
+    b.classList.toggle("hidden", label === null);
+    if (label) b.textContent = label;
+  }
+
+  /** The menus are up and their start button can be pressed. */
+  get canStart() {
+    return !this.overlay.classList.contains("hidden") && !byId("start").classList.contains("hidden");
+  }
+
   overlayText(html: string) {
     this.ovText.innerHTML = html;
   }
 
   private modeButtons: HTMLButtonElement[] = [];
   private onMode: (mode: "solo" | "mp") => void = () => {};
+
+  /** The starting weapon cards: name, a line about it, damage / range / rate as pips. */
+  setupWeapons(current: Primary, onChange: (w: Primary) => void) {
+    const box = byId("weapons");
+    const labels = ["Урон", "Дальность", "Темп"];
+    box.innerHTML = PRIMARY_LIST.map((w) => {
+      const p = PRIMARIES[w];
+      const bars = p.bars.map((n, i) => `<div class="wbar"><span>${labels[i]}</span><b>${"●".repeat(n)}<em>${"●".repeat(5 - n)}</em></b></div>`).join("");
+      return `<button type="button" class="weapon" data-w="${w}"><strong>${p.name}</strong><small>${p.blurb}</small>${bars}</button>`;
+    }).join("");
+    const buttons = [...box.querySelectorAll<HTMLButtonElement>(".weapon")];
+    const select = (w: Primary) => buttons.forEach((b) => b.classList.toggle("selected", b.dataset.w === w));
+    select(current);
+    for (const b of buttons) {
+      b.addEventListener("click", () => {
+        const w = b.dataset.w as Primary;
+        select(w);
+        onChange(w);
+      });
+    }
+  }
 
   /** The single-player / multiplayer switch on the start screen, and the room controls. */
   setupModes(h: { mode(mode: "solo" | "mp"): void; create(): void; join(code: string): void }) {
@@ -317,8 +351,10 @@ export class Hud {
     c.fillStyle = "#4be37a";
     for (const k of g.arena ? [] : g.pickups.list) c.fillRect(px(k.root.position.x) - 2, pz(k.root.position.z) - 2, 4, 4);
 
+    // Other players aren't on the map: finding them is part of it.
     for (const e of g.enemies.list) {
-      c.fillStyle = e.color ?? "#ff3b3b";
+      if (e.pilot !== undefined) continue;
+      c.fillStyle = "#ff3b3b";
       c.beginPath();
       c.arc(px(e.pos.x), pz(e.pos.z), e.spec.boss ? 7 : e.pilot !== undefined || e.kind === "titan" || e.kind === "heavyDrone" ? 4 : 2.5, 0, Math.PI * 2);
       c.fill();

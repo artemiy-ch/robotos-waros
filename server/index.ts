@@ -5,8 +5,18 @@ import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   BASES,
+  TURRET_COST,
+  TURRET_POINTS,
+  BOUNTY_POINTS,
+  DROP_AT,
+  HEADSHOT_POINTS,
+  leaderOf,
   BOT_POINTS,
   BOTS,
+  WORLD,
+  WORLD_MINES,
+  WORLD_MINE_RESPAWN,
+  worldWire,
   CAPTURE_TIME,
   COIN_POINTS,
   COINS,
@@ -26,6 +36,7 @@ import {
   FLAGS,
   KILL_POINTS,
   MAX_PLAYERS,
+  PROTOCOL,
   RECAPTURE_TIME,
   ROUND_BREAK,
   TARGET_SCORE,
@@ -75,6 +86,10 @@ interface Room {
   nextMine: number;
   /** Whose game runs the bots: the longest in the room. */
   host: number;
+  /** Seconds until each tripped tripwire of the server's own is set again somewhere. */
+  wireRespawns: number[];
+  /** Seconds to this round's drop pod (below zero once it has come). */
+  dropT: number;
 }
 
 const rooms = new Map<string, Room>();
@@ -95,13 +110,14 @@ function newCode() {
   }
 }
 
-const freshFlags = (): FlagState[] => FLAGS.map(() => ({ owner: null, taker: null, progress: 0, contested: false }));
+const freshFlags = (): FlagState[] => FLAGS.map(() => ({ owner: null, taker: null, progress: 0, contested: false, turret: WORLD }));
 
 function createRoom(): Room {
   const room: Room = {
     code: newCode(), clients: new Map(), flags: freshFlags(), crates: [], respawns: [], income: 0, winner: null, breakT: 0, nextId: 1, nextCrate: 1,
-    items: [], itemRespawns: [], mines: [], nextItem: 1, nextMine: 1, host: 0,
+    items: [], itemRespawns: [], mines: [], nextItem: 1, nextMine: 1, host: 0, wireRespawns: [], dropT: DROP_AT,
   };
+  for (let i = 0; i < WORLD_MINES; i++) addWorldMine(room, false);
   for (let i = 0; i < CRATES; i++) addCrate(room, false);
   for (let i = 0; i < COINS; i++) addItem(room, "coin", false);
   for (let i = 0; i < WIRE_KITS; i++) addItem(room, "wire", false);
@@ -135,6 +151,28 @@ function addItem(room: Room, kind: ItemInfo["kind"], announce: boolean) {
   if (announce) broadcast(room, { t: "item", item });
 }
 
+/** One of the server's own tripwires, near a random flag. */
+function addWorldMine(room: Room, announce: boolean) {
+  const [a, b] = worldWire(FLAGS[Math.floor(Math.random() * FLAGS.length)]);
+  const mine = { id: room.nextMine++, owner: WORLD, a, b };
+  room.mines.push(mine);
+  if (announce) broadcast(room, { t: "mine", mine });
+}
+
+/** A fresh round: no winner, no flags held, nobody's points or tripwires (the server's own stay). */
+function newRound(room: Room) {
+  room.winner = null;
+  room.dropT = DROP_AT;
+  // Last round's pod, if nobody got it, goes.
+  for (const c of room.crates.filter((k) => k.drop)) broadcast(room, { t: "taken", crate: c.id, by: 0 });
+  room.crates = room.crates.filter((k) => !k.drop);
+  room.flags = freshFlags();
+  for (const c of room.clients.values()) c.info.score = c.info.kills = 0;
+  for (const m of room.mines.filter((x) => x.owner !== WORLD)) broadcast(room, { t: "boom", mine: m.id, victim: null });
+  room.mines = room.mines.filter((x) => x.owner === WORLD);
+  broadcast(room, { t: "round" });
+}
+
 const finite = (v: unknown): v is [number, number, number] => Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n));
 
 function freeBase(room: Room) {
@@ -143,6 +181,10 @@ function freeBase(room: Room) {
 }
 
 function join(ws: WebSocket, msg: Extract<ClientMessage, { t: "join" }>): [Room, Client] | null {
+  if (msg.v !== PROTOCOL) {
+    send(ws, { t: "old" });
+    return null;
+  }
   let room: Room | undefined;
   if (msg.room) {
     room = rooms.get(msg.room.toUpperCase());
@@ -163,6 +205,8 @@ function join(ws: WebSocket, msg: Extract<ClientMessage, { t: "join" }>): [Room,
   send(ws, { t: "welcome", host: room.host, id: info.id, room: room.code, players: [...room.clients.values()].map((c) => c.info), flags: room.flags, crates: room.crates, items: room.items, mines: room.mines, winner: room.winner });
   broadcast(room, { t: "joined", player: info }, info.id);
   console.log(`${room.code}: ${info.nick} joined (${room.clients.size})`);
+  // Someone to play against at last: the round so far was only practice.
+  if (room.clients.size === 2) newRound(room);
   return [room, client];
 }
 
@@ -174,6 +218,7 @@ function leave(room: Room, id: number) {
   }
   for (const f of room.flags) {
     if (f.owner === id) f.owner = null;
+    if (f.turret === id) f.turret = null;
     if (f.taker === id) (f.taker = null), (f.progress = 0);
   }
   broadcast(room, { t: "left", id });
@@ -194,7 +239,7 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
       break;
     case "hit": {
       const target = room.clients.get(msg.to);
-      if (target && target !== me && room.winner === null) send(target.ws, { t: "hurt", from: id, dmg: Math.min(MAX_HIT, Math.max(0, msg.dmg)) });
+      if (target && target !== me && room.winner === null) send(target.ws, { t: "hurt", from: id, dmg: Math.min(MAX_HIT, Math.max(0, msg.dmg)), head: !!msg.head });
       break;
     }
     case "stun": {
@@ -203,16 +248,19 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
       break;
     }
     case "died": {
-      if (msg.by === BOTS) {
-        broadcast(room, { t: "kill", killer: BOTS, victim: id });
+      if (msg.by === BOTS || msg.by === WORLD) {
+        broadcast(room, { t: "kill", killer: msg.by, victim: id });
         break;
       }
       const killer = msg.by !== null && msg.by !== id ? room.clients.get(msg.by) : undefined;
+      // The leader's head is worth more; a shot to the head adds a little.
+      const bounty = !!killer && leaderOf([...room.clients.values()].map((c) => c.info)) === id;
+      const head = !!killer && !!msg.head;
       if (killer && room.winner === null) {
         killer.info.kills++;
-        killer.info.score += KILL_POINTS;
+        killer.info.score += (bounty ? BOUNTY_POINTS : KILL_POINTS) + (head ? HEADSHOT_POINTS : 0);
       }
-      broadcast(room, { t: "kill", killer: killer ? killer.info.id : null, victim: id });
+      broadcast(room, { t: "kill", killer: killer ? killer.info.id : null, victim: id, head, bounty });
       break;
     }
     case "rocket":
@@ -221,8 +269,8 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
     case "take": {
       const i = room.crates.findIndex((c) => c.id === msg.crate);
       if (i < 0) break;
-      room.crates.splice(i, 1);
-      room.respawns.push(CRATE_RESPAWN);
+      const [taken] = room.crates.splice(i, 1);
+      if (!taken.drop) room.respawns.push(CRATE_RESPAWN);
       broadcast(room, { t: "taken", crate: msg.crate, by: id });
       break;
     }
@@ -251,7 +299,8 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
     case "trip": {
       const i = room.mines.findIndex((m) => m.id === msg.mine);
       if (i < 0) break;
-      room.mines.splice(i, 1);
+      const [gone] = room.mines.splice(i, 1);
+      if (gone.owner === WORLD) room.wireRespawns.push(WORLD_MINE_RESPAWN);
       broadcast(room, { t: "boom", mine: msg.mine, victim: id });
       break;
     }
@@ -265,7 +314,28 @@ function handle(room: Room, me: Client, msg: ClientMessage) {
     }
     case "bothurt": {
       const target = room.clients.get(msg.to);
-      if (id === room.host && target && target !== me) send(target.ws, { t: "hurt", from: BOTS, dmg: Math.min(MAX_HIT, Math.max(0, msg.dmg)) });
+      // A player's turret's shot counts as theirs.
+      const from = msg.by !== undefined && room.clients.has(msg.by) ? msg.by : BOTS;
+      if (id === room.host && target && target !== me) send(target.ws, { t: "hurt", from, dmg: Math.min(MAX_HIT, Math.max(0, msg.dmg)) });
+      break;
+    }
+    case "turret": {
+      // Our own turret on our flag, if there is none and we can pay for it.
+      const f = room.flags[msg.flag];
+      if (!f || f.owner !== id || f.turret !== null || me.info.score < TURRET_COST || room.winner !== null) break;
+      me.info.score -= TURRET_COST;
+      f.turret = id;
+      broadcast(room, { t: "turretup", flag: msg.flag, by: id });
+      break;
+    }
+    case "turretdown": {
+      const f = room.flags[msg.flag];
+      if (id !== room.host || !f || f.turret === null) break;
+      const owner = f.turret;
+      f.turret = null;
+      const killer = msg.killer !== null ? room.clients.get(msg.killer) : undefined;
+      if (killer && killer.info.id !== owner && room.winner === null) killer.info.score += TURRET_POINTS;
+      broadcast(room, { t: "turretdown", flag: msg.flag, killer: killer ? killer.info.id : null });
       break;
     }
     case "botkill": {
@@ -316,12 +386,7 @@ function tick(room: Room, dt: number) {
   if (room.winner !== null) {
     room.breakT -= dt;
     if (room.breakT <= 0) {
-      room.winner = null;
-      room.flags = freshFlags();
-      for (const c of room.clients.values()) c.info.score = c.info.kills = 0;
-      for (const m of room.mines) broadcast(room, { t: "boom", mine: m.id, victim: null });
-      room.mines = [];
-      broadcast(room, { t: "round" });
+      newRound(room);
     }
   } else {
     updateFlags(room, dt);
@@ -341,6 +406,22 @@ function tick(room: Room, dt: number) {
       broadcast(room, { t: "win", id: best.info.id });
     }
   }
+  // Once a round a pod with a minigun comes down on a street somewhere.
+  if (room.dropT > 0 && room.winner === null) {
+    room.dropT -= dt;
+    if (room.dropT <= 0) {
+      const [x, z] = streetSpot();
+      const crate = { id: room.nextCrate++, x, z, weapon: "minigun" as const, drop: true };
+      room.crates.push(crate);
+      broadcast(room, { t: "crate", crate });
+    }
+  }
+  for (let i = room.wireRespawns.length - 1; i >= 0; i--) {
+    room.wireRespawns[i] -= dt;
+    if (room.wireRespawns[i] > 0) continue;
+    room.wireRespawns.splice(i, 1);
+    addWorldMine(room, true);
+  }
   for (let i = room.itemRespawns.length - 1; i >= 0; i--) {
     const r = room.itemRespawns[i];
     r.t -= dt;
@@ -356,11 +437,15 @@ function tick(room: Room, dt: number) {
   }
   const ps: Record<number, PilotState> = {};
   const scores: Record<number, [number, number]> = {};
+  // Players whose game has stopped sending (a hidden tab, a lost connection).
+  const quiet: number[] = [];
+  const now = Date.now();
   for (const [id, c] of room.clients) {
     if (c.state) ps[id] = c.state;
+    if (now - c.seen > STALE) quiet.push(id);
     scores[id] = [c.info.score, c.info.kills];
   }
-  broadcast(room, { t: "snap", ps, flags: room.flags, scores });
+  broadcast(room, { t: "snap", ps, flags: room.flags, scores, quiet });
 }
 
 const http = createServer((req, res) => {
@@ -372,9 +457,24 @@ const http = createServer((req, res) => {
 });
 const wss = new WebSocketServer({ server: http });
 
+/** Connections that answered the last ping; one that misses a ping is dead and dropped. */
+const alive = new WeakSet<WebSocket>();
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!alive.has(ws)) {
+      ws.terminate();
+      continue;
+    }
+    alive.delete(ws);
+    ws.ping();
+  }
+}, 10_000);
+
 wss.on("connection", (ws) => {
   let room: Room | null = null;
   let me: Client | null = null;
+  alive.add(ws);
+  ws.on("pong", () => alive.add(ws));
   ws.on("message", (data) => {
     let msg: ClientMessage;
     try {
@@ -388,7 +488,12 @@ wss.on("connection", (ws) => {
       if (joined) [room, me] = joined;
       return;
     }
-    handle(room, me, msg);
+    // A bad message from one game mustn't bring the server (and every room) down.
+    try {
+      handle(room, me, msg);
+    } catch (err) {
+      console.error(err);
+    }
   });
   ws.on("close", () => {
     if (room && me) {
@@ -404,7 +509,13 @@ setInterval(() => {
   const now = performance.now();
   const dt = Math.min(0.25, (now - last) / 1000);
   last = now;
-  for (const room of rooms.values()) tick(room, dt);
+  for (const room of rooms.values()) {
+    try {
+      tick(room, dt);
+    } catch (err) {
+      console.error(err);
+    }
+  }
 }, TICK * 1000);
 
 http.listen(PORT, () => console.log(`Robot Wars server on :${PORT}`));

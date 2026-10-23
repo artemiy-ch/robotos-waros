@@ -21,6 +21,9 @@ interface Crate {
   /** Multiplayer: the server's number for it, and when we last asked for it. */
   id?: number;
   asked?: number;
+  /** A drop pod, and how high above the street it still is. */
+  drop?: boolean;
+  fall?: number;
 }
 
 /** Weapon crates (the kit's animated chest) holding a laser or a tesla gun; a beam of light in the weapon's colour marks each one. */
@@ -52,8 +55,20 @@ export class Loot {
   }
 
   /** A crate the server has put down. */
-  add(info: CrateInfo) {
+  add(info: CrateInfo, g?: Game) {
     this.place(info.x, info.z, info.weapon, info.id);
+    if (!info.drop) return;
+    // Out of the sky: a big gold beam marks where it will land.
+    const c = this.crates[this.crates.length - 1];
+    c.drop = true;
+    c.fall = 140;
+    c.mech.root.position.y = c.fall;
+    c.beacon.scaling.set(3, 4, 3);
+    c.beacon.position.y = 80;
+    if (g) {
+      g.hud.banner("Сброс с неба: шестистволка!", 3);
+      g.sfx.missileWarning();
+    }
   }
 
   /** The server gave a crate away: it opens for everyone, and its weapon goes to `mine`'s player. */
@@ -122,6 +137,18 @@ export class Loot {
     for (let i = this.crates.length - 1; i >= 0; i--) {
       const c = this.crates[i];
       c.mech.anim.update(dt);
+      if (c.fall) {
+        c.fall = Math.max(0, c.fall - dt * 60);
+        c.mech.root.position.y = c.fall;
+        if (c.fall === 0) {
+          const d = Vector3.Distance(c.pos, g.player.pos);
+          g.fx.explosion(c.pos.add(new Vector3(0, 1, 0)), 1.6, true);
+          g.fx.dust(c.pos.add(new Vector3(0, 0.3, 0)), 16);
+          g.sfx.slam(d);
+          g.addShake(d, 0.7);
+        }
+        continue;
+      }
       if (c.opened < 0) {
         const near = Math.hypot(c.pos.x - p.pos.x, c.pos.z - p.pos.z) < PICK_RADIUS && p.pos.y < 3;
         if (!near || !p.alive || g.state !== "playing") continue;

@@ -10,15 +10,40 @@ const STEP = BLOCK + ROAD;
 const HALF = (BLOCKS * BLOCK + (BLOCKS + 1) * ROAD) / 2;
 export const crossingXZ = (i: number, j: number): [number, number] => [-HALF + ROAD / 2 + i * STEP, -HALF + ROAD / 2 + j * STEP];
 
+/** Bumped whenever the messages or the rules change: a game and a server of different versions don't play together. */
+export const PROTOCOL = 10;
+
 export const MAX_PLAYERS = 4;
 /** Points to win: a held flag earns one a second, a kill earns KILL_POINTS. */
 export const TARGET_SCORE = 1000;
 export const KILL_POINTS = 15;
+/** Extra for a kill with a shot to the head (which does HEADSHOT times the damage). */
+export const HEADSHOT_POINTS = 10;
+export const HEADSHOT = 1.75;
+/** The leader (with at least BOUNTY_FROM points) has a price on their head: this much for bringing them down instead of KILL_POINTS. */
+export const BOUNTY_POINTS = 50;
+export const BOUNTY_FROM = 50;
+/** One drop pod a round, this many seconds in. */
+export const DROP_AT = 90;
+
+/** Who has the price on their head: the one in the lead, once they have BOUNTY_FROM points; nobody on a tie. */
+export function leaderOf(scores: { id: number; score: number }[]): number | null {
+  const sorted = [...scores].sort((a, b) => b.score - a.score);
+  if (!sorted.length || sorted[0].score < BOUNTY_FROM || sorted[1]?.score === sorted[0].score) return null;
+  return sorted[0].id;
+}
 /** Points for bringing down a bot; and the "player" bots count as when they kill someone. */
 export const BOT_POINTS = 5;
 export const BOTS = -1;
 /** Seconds the winner is shown before the next round starts. */
 export const ROUND_BREAK = 12;
+/**
+ * Turrets on the flags: a neutral one (shoots every player) on each at the start of a round; once
+ * it is destroyed, whoever holds the flag can put up their own for TURRET_COST points, which shoots
+ * only the others. Bringing one down is worth TURRET_POINTS.
+ */
+export const TURRET_COST = 60;
+export const TURRET_POINTS = 20;
 /** Seconds dead before a player is back at their base. */
 export const RESPAWN_TIME = 5;
 
@@ -37,15 +62,15 @@ export interface Flag {
  * each quarter. Buildings don't fall in multiplayer, so the roofs stay.
  */
 export const FLAGS: Flag[] = [
-  { name: "А", at: crossingXZ(4, 4), y: 0, radius: 14 },
-  { name: "Б", at: crossingXZ(2, 2), y: 0, radius: 14 },
-  { name: "В", at: crossingXZ(6, 2), y: 0, radius: 14 },
-  { name: "Г", at: crossingXZ(2, 6), y: 0, radius: 14 },
-  { name: "Д", at: crossingXZ(6, 6), y: 0, radius: 14 },
-  { name: "Е", at: [-75, 75], y: 31.64, radius: 15 },
-  { name: "Ж", at: [-125, 25], y: 33.28, radius: 15 },
-  { name: "З", at: [66.5, 66.5], y: 37.69, radius: 8.5 },
-  { name: "И", at: [66.5, -83.5], y: 28.4, radius: 8.5 },
+  { name: "A", at: crossingXZ(4, 4), y: 0, radius: 14 },
+  { name: "B", at: crossingXZ(2, 2), y: 0, radius: 14 },
+  { name: "C", at: crossingXZ(6, 2), y: 0, radius: 14 },
+  { name: "D", at: crossingXZ(2, 6), y: 0, radius: 14 },
+  { name: "E", at: crossingXZ(6, 6), y: 0, radius: 14 },
+  { name: "F", at: [-75, 75], y: 31.64, radius: 15 },
+  { name: "G", at: [-125, 25], y: 33.28, radius: 15 },
+  { name: "H", at: [66.5, 66.5], y: 37.69, radius: 8.5 },
+  { name: "I", at: [66.5, -83.5], y: 28.4, radius: 8.5 },
 ];
 
 /** Whether a robot at (x, y, z) is in a flag's zone: near it, and on its roof (or low over the crossing). */
@@ -62,7 +87,8 @@ export const RECAPTURE_TIME = 6;
 
 /** Each player's home corner, in order of joining. */
 export const BASES = [crossingXZ(0, 0), crossingXZ(8, 8), crossingXZ(8, 0), crossingXZ(0, 8)];
-export const COLORS = ["#ff7a1a", "#2fd5ff", "#b6ff3a", "#ff3bd0"];
+/** As different from each other as they come: red, blue, yellow, green. */
+export const COLORS = ["#ff2e2e", "#2f7bff", "#ffd60a", "#2bdc4a"];
 
 /** Weapon crates: how many lie about, how soon a taken one comes back somewhere else. */
 export const CRATES = 6;
@@ -91,6 +117,42 @@ export const WIRE_LENGTH = 24;
 export const MINE_ARM = 1.5;
 export const MINE_DAMAGE = 55;
 
+/** Tripwires the server sets by itself near the flags (owner WORLD), and how soon a tripped one is replaced. */
+export const WORLD = 0;
+export const WORLD_MINES = 5;
+export const WORLD_MINE_RESPAWN = 10;
+
+/**
+ * A tripwire near a flag: across a street leading into its crossing (sometimes a post standing up,
+ * against flyers), or across its roof. Returns its two ends.
+ */
+export function worldWire(f: Flag): [[number, number, number], [number, number, number]] {
+  const [x, z] = f.at;
+  const r = (n: number) => Math.round(n * 100) / 100;
+  if (f.y) {
+    const cx = x + (Math.random() - 0.5) * f.radius, cz = z + (Math.random() - 0.5) * f.radius;
+    const half = Math.min(f.radius * 0.9, WIRE_LENGTH / 2);
+    const alongX = Math.random() < 0.5;
+    return [
+      [r(alongX ? cx - half : cx), r(f.y + 1.2), r(alongX ? cz : cz - half)],
+      [r(alongX ? cx + half : cx), r(f.y + 1.2), r(alongX ? cz : cz + half)],
+    ];
+  }
+  const dir = [[1, 0], [-1, 0], [0, 1], [0, -1]][Math.floor(Math.random() * 4)];
+  const out = 18 + Math.random() * 12;
+  const cx = x + dir[0] * out, cz = z + dir[1] * out;
+  if (Math.random() < 0.3) {
+    const side = (Math.random() - 0.5) * (ROAD - 4);
+    const px = cx + dir[1] * side, pz = cz + dir[0] * side;
+    return [[r(px), 0.3, r(pz)], [r(px), 14, r(pz)]];
+  }
+  const half = ROAD / 2 - 0.5;
+  return [
+    [r(cx - dir[1] * half), 1.2, r(cz - dir[0] * half)],
+    [r(cx + dir[1] * half), 1.2, r(cz + dir[0] * half)],
+  ];
+}
+
 /** Somewhere on a street between two crossings, off the middle line. */
 export function streetSpot(): [number, number] {
   const i = Math.floor(Math.random() * (BLOCKS + 1)), j = Math.floor(Math.random() * BLOCKS);
@@ -109,7 +171,7 @@ export function coinSpot(): [number, number, number] {
   return [x + (Math.random() - 0.5) * Math.max(0, hw * 2 - 3), z + (Math.random() - 0.5) * Math.max(0, hd * 2 - 3), h + 1.6];
 }
 
-export type Weapon = "laser" | "tesla" | "shawarma";
+export type Weapon = "laser" | "tesla" | "shawarma" | "minigun";
 export type Skin = "dark" | "light" | "rainbow";
 
 /** What each client says about its own robot, 20 times a second. */
@@ -136,6 +198,8 @@ export interface PilotState {
   hp: number;
   /** Still under the spawn guard. */
   pr: boolean;
+  /** The starting weapon on its left button. */
+  w: string;
 }
 
 export interface PlayerInfo {
@@ -154,6 +218,8 @@ export interface FlagState {
   taker: number | null;
   progress: number;
   contested: boolean;
+  /** The turret on it: WORLD (0) for a neutral one, a player's id for theirs, null for none. */
+  turret: number | null;
 }
 
 export interface CrateInfo {
@@ -161,6 +227,8 @@ export interface CrateInfo {
   x: number;
   z: number;
   weapon: Weapon;
+  /** Dropped from the sky (the minigun pod) rather than lying about. */
+  drop?: boolean;
 }
 
 export interface ItemInfo {
@@ -180,14 +248,14 @@ export interface MineInfo {
 }
 
 /** One of the host's bots, as the others are told: [number, kind, x, y, z, yaw, shots since last time, aim x, y, z]. */
-export type BotState = [number, string, number, number, number, number, number, number, number, number];
+export type BotState = [number, string, number, number, number, number, number, number, number, number, number?];
 
 export type ClientMessage =
-  | { t: "join"; room: string | null; nick: string; skin: Skin }
+  | { t: "join"; room: string | null; nick: string; skin: Skin; v: number }
   | { t: "state"; s: PilotState }
-  | { t: "hit"; to: number; dmg: number }
+  | { t: "hit"; to: number; dmg: number; head?: boolean }
   | { t: "stun"; to: number; s: number }
-  | { t: "died"; by: number | null }
+  | { t: "died"; by: number | null; head?: boolean }
   | { t: "rocket"; from: [number, number, number]; dir: [number, number, number] }
   | { t: "take"; crate: number }
   | { t: "grab"; item: number }
@@ -195,21 +263,24 @@ export type ClientMessage =
   | { t: "trip"; mine: number }
   | { t: "bots"; list: BotState[] }
   | { t: "bothit"; bot: number; dmg: number }
-  | { t: "bothurt"; to: number; dmg: number }
+  | { t: "bothurt"; to: number; dmg: number; by?: number }
+  | { t: "turret"; flag: number }
+  | { t: "turretdown"; flag: number; killer: number | null }
   | { t: "botkill"; killer: number }
   | { t: "look"; nick: string; skin: Skin };
 
 export type ServerMessage =
   | { t: "welcome"; id: number; room: string; players: PlayerInfo[]; flags: FlagState[]; crates: CrateInfo[]; items: ItemInfo[]; mines: MineInfo[]; winner: number | null; host: number }
   | { t: "full" }
+  | { t: "old" }
   | { t: "nope" }
   | { t: "joined"; player: PlayerInfo }
   | { t: "left"; id: number }
   | { t: "look"; id: number; nick: string; skin: Skin }
-  | { t: "snap"; ps: Record<number, PilotState>; flags: FlagState[]; scores: Record<number, [number, number]> }
-  | { t: "hurt"; from: number; dmg: number }
+  | { t: "snap"; ps: Record<number, PilotState>; flags: FlagState[]; scores: Record<number, [number, number]>; quiet: number[] }
+  | { t: "hurt"; from: number; dmg: number; head?: boolean }
   | { t: "stunned"; from: number; s: number }
-  | { t: "kill"; killer: number | null; victim: number }
+  | { t: "kill"; killer: number | null; victim: number; head?: boolean; bounty?: boolean }
   | { t: "rocket"; id: number; from: [number, number, number]; dir: [number, number, number] }
   | { t: "captured"; flag: number; by: number }
   | { t: "crate"; crate: CrateInfo }
@@ -219,6 +290,8 @@ export type ServerMessage =
   | { t: "mine"; mine: MineInfo }
   | { t: "boom"; mine: number; victim: number | null }
   | { t: "host"; id: number }
+  | { t: "turretup"; flag: number; by: number }
+  | { t: "turretdown"; flag: number; killer: number | null }
   | { t: "bots"; list: BotState[] }
   | { t: "bothit"; from: number; bot: number; dmg: number }
   | { t: "win"; id: number }

@@ -2,6 +2,9 @@ import { Color3, Matrix, Mesh, MeshBuilder, Quaternion, StandardMaterial, Vector
 import {
   BASES,
   BOTS,
+  WORLD,
+  TURRET_COST,
+  leaderOf,
   type BotState,
   BOOST_EVERY,
   COIN_POINTS,
@@ -26,7 +29,9 @@ import { Enemies, type Enemy, type Kind } from "./enemies";
 import type { Game } from "./game";
 import type { Net } from "./net";
 import { Player } from "./player";
+import { PRIMARY_LIST, type Primary } from "./primary";
 import { paintHero } from "./skins";
+import { NEUTRAL_TURRET, turretSpot } from "./turret";
 import { segSphere } from "./util";
 import { LaserBeam } from "./weapons";
 
@@ -41,10 +46,10 @@ const NEUTRAL = "#d9dde3";
 const GRAB_RADIUS = 3.4;
 const PLANT_REACH = 45;
 /** Bots: how many the host keeps going (more with more players), how often it adds one, how often it reports them. */
-const BOTS_BASE = 4;
-const BOTS_PER_PLAYER = 2;
-const BOTS_MAX = 12;
-const BOT_SPAWN_EVERY = 3;
+const BOTS_BASE = 6;
+const BOTS_PER_PLAYER = 3;
+const BOTS_MAX = 18;
+const BOT_SPAWN_EVERY = 2;
 const BOT_SEND = 0.1;
 
 /** Another player in the room: their robot (for show, and a target in the enemy list) and its name tag. */
@@ -55,6 +60,10 @@ interface Remote {
   tag: HTMLElement;
   hpBar: HTMLElement;
   beams: LaserBeam[] | null;
+  /** Their game has gone quiet (hidden tab, lost connection): the robot stands frozen. */
+  quiet: boolean;
+  /** Time to the next round of their minigun, for show. */
+  miniT?: number;
   /** Timers for the show copies of their tesla zaps, buster shots and lobbed shawarmas. */
   zapT: number;
   blastT: number;
@@ -86,7 +95,11 @@ export class Arena {
   private flagMeshes: Mesh[] = [];
   winner: number | null;
   private sendT = 0;
-  private lastHit: { id: number; t: number } | null = null;
+  /** Who hit us last and when (and whether in the head): their kill if we go down soon after. */
+  private lastHit: { id: number; t: number; head?: boolean } | null = null;
+  /** Who has the price on their head now, and the beam of light over them. */
+  private leader: number | null = null;
+  private bountyBeam: Mesh | null = null;
   private time = 0;
   private respawnT = -1;
   private ui: HTMLElement;
@@ -189,7 +202,7 @@ export class Arena {
     tag.innerHTML = `<span></span><div class="mp-tag-hp"><i></i></div>`;
     tag.querySelector("span")!.textContent = info.nick;
     this.ui.append(tag);
-    this.remotes.set(info.id, { info, player, state: null, tag, hpBar: tag.querySelector("i")!, beams: null, zapT: 0, blastT: 0, lobT: 0, gun: 0 });
+    this.remotes.set(info.id, { info, player, state: null, tag, hpBar: tag.querySelector("i")!, beams: null, quiet: false, zapT: 0, blastT: 0, lobT: 0, gun: 0 });
   }
 
   private removePlayer(id: number) {
@@ -197,6 +210,7 @@ export class Arena {
     const r = this.remotes.get(id);
     if (!r) return;
     this.g.enemies.removePilot(id);
+    this.g.arsenal.forget(id);
     r.player.dispose();
     for (const b of r.beams ?? []) b.dispose();
     r.tag.remove();
@@ -267,6 +281,11 @@ export class Arena {
           const r = this.remotes.get(Number(id));
           if (r) r.state = s;
         }
+        for (const r of this.remotes.values()) {
+          const quiet = msg.quiet?.includes(r.info.id) ?? false;
+          if (quiet !== r.quiet) r.tag.querySelector("span")!.textContent = quiet ? `${r.info.nick} · нет связи` : r.info.nick;
+          r.quiet = quiet;
+        }
         for (const [id, [score, kills]] of Object.entries(msg.scores)) {
           const info = this.infos.get(Number(id));
           if (info) (info.score = score), (info.kills = kills);
@@ -274,7 +293,7 @@ export class Arena {
         g.score = this.mine.score;
         break;
       case "hurt":
-        this.lastHit = { id: msg.from, t: this.time };
+        this.lastHit = { id: msg.from, t: this.time, head: msg.head };
         g.hurtPlayer(msg.dmg);
         break;
       case "stunned":
@@ -285,12 +304,17 @@ export class Arena {
         break;
       case "kill": {
         const { killer, victim } = msg;
+        const extra = (msg.head ? " · <b>ХЕДШОТ</b>" : "") + (msg.bounty ? " · награда за голову!" : "");
         this.log(
-          killer === BOTS ? `Боты сбили ${this.colored(victim)}` : killer === null ? `${this.colored(victim)} разбился` : `${this.colored(killer)} сбил ${this.colored(victim)}`,
+          killer === BOTS
+            ? `Боты сбили ${this.colored(victim)}`
+            : killer === WORLD
+              ? `${this.colored(victim)} подорвался на растяжке`
+              : killer === null ? `${this.colored(victim)} разбился` : `${this.colored(killer)} сбил ${this.colored(victim)}${extra}`,
         );
         if (killer === this.me) {
-          g.hud.callout(`Сбит: ${this.nick(victim)}`);
-          g.sfx.callout(0);
+          g.hud.callout(msg.bounty ? "Награда за голову! +50" : msg.head ? "ХЕДШОТ!" : `Сбит: ${this.nick(victim)}`);
+          g.sfx.callout(msg.bounty || msg.head ? 2 : 0);
         }
         break;
       }
@@ -307,11 +331,14 @@ export class Arena {
         } else this.log(`${this.colored(msg.by)} взял флаг ${FLAGS[msg.flag].name}`);
         break;
       case "crate":
-        g.loot.add(msg.crate);
+        g.loot.add(msg.crate, g);
         break;
-      case "taken":
+      case "taken": {
+        const pod = g.loot.crates.find((c) => c.id === msg.crate)?.drop;
         g.loot.open(msg.crate, msg.by === this.me, g);
+        if (pod && msg.by > 0 && msg.by !== this.me) this.log(`${this.colored(msg.by)} забрал шестистволку`);
         break;
+      }
       case "host":
         this.host = msg.id;
         // Taking over the bots: the copies go, and ours will come.
@@ -328,6 +355,16 @@ export class Arena {
         e.by = undefined;
         break;
       }
+      case "turretup":
+        if (msg.by === this.me) {
+          g.hud.banner(`Твоя турель на флаге ${FLAGS[msg.flag].name}`, 2);
+          g.sfx.powerup();
+        } else this.log(`${this.colored(msg.by)} поставил турель на ${FLAGS[msg.flag].name}`);
+        break;
+      case "turretdown":
+        if (msg.killer === this.me) g.hud.callout(`Турель разбита! +20`);
+        else if (msg.killer !== null) this.log(`${this.colored(msg.killer)} разбил турель на ${FLAGS[msg.flag].name}`);
+        break;
       case "item":
         this.addItem(msg.item);
         break;
@@ -358,8 +395,8 @@ export class Arena {
   // ---- Our side ----
 
   /** Every other player's robot, hit by one of our weapons. */
-  hitPilot(id: number, dmg: number) {
-    this.net.hit(id, dmg);
+  hitPilot(id: number, dmg: number, head = false) {
+    this.net.hit(id, dmg, head);
   }
 
   stunPilot(id: number, seconds: number) {
@@ -373,9 +410,9 @@ export class Arena {
   /** We went down: whoever hit us last (lately) gets the kill; back at base after a while. */
   died() {
     const by = this.lastHit && this.time - this.lastHit.t < KILL_CREDIT ? this.lastHit.id : null;
-    this.net.send({ t: "died", by });
+    this.net.send({ t: "died", by, head: by !== null && by > 0 && !!this.lastHit?.head });
     this.respawnT = RESPAWN_TIME;
-    this.g.hud.banner(by === BOTS ? "Тебя сбили боты" : by !== null ? `Тебя сбил ${this.nick(by)}` : "Робот уничтожен", 2.5);
+    this.g.hud.banner(by === BOTS ? "Тебя сбили боты" : by === WORLD ? "Подорвался на растяжке" : by !== null ? `Тебя сбил ${this.nick(by)}` : "Робот уничтожен", 2.5);
   }
 
   look(nick: string, skin: PlayerInfo["skin"]) {
@@ -404,6 +441,7 @@ export class Arena {
           g: p.grounded, th: p.thrusting, al: p.alive, f: g.input.fire && g.state === "playing", alt: g.input.alt && g.state === "playing",
           sp: p.special, ax: r(aim.x), ay: r(aim.y), az: r(aim.z), hp: Math.round(p.hp + p.shield),
           pr: this.guard > 0,
+          w: g.primary,
         },
       });
       this.net.flush();
@@ -411,35 +449,114 @@ export class Arena {
       this.botHits.clear();
     }
     if (this.isHost) this.runBots(dt);
+    if (g.state === "playing" && g.player.alive && g.input.pressed("KeyB")) this.buyTurret();
     if (this.guard > 0) {
       const shooting = g.state === "playing" && (g.input.fire || g.input.alt || g.input.down("KeyE"));
       this.guard = shooting ? 0 : Math.max(0, this.guard - dt);
       g.player.mech.setFlash(this.guard > 0 && Math.sin(this.time * 18) > 0);
     }
     for (const r of this.remotes.values()) this.updateRemote(r, dt);
+    this.updateBounty();
     this.updateFlags();
     this.updateItems(dt);
     this.updateMines();
     this.updateUi();
   }
 
+  // ---- The price on the leader's head ----
+
+  /** A tall beam of gold over whoever leads, for everyone to hunt; and a word to the leader. */
+  private updateBounty() {
+    const g = this.g;
+    const leader = leaderOf([...this.infos.values()]);
+    if (leader !== this.leader) {
+      if (leader === this.me) g.hud.banner("За твою голову назначена награда!", 2.5);
+      else if (leader !== null) this.log(`За голову ${this.colored(leader)} назначена награда`);
+      for (const r of this.remotes.values()) r.tag.querySelector("span")!.textContent = (r.info.id === leader ? "★ " : "") + r.info.nick;
+      this.leader = leader;
+    }
+    const r = leader !== null ? this.remotes.get(leader) : undefined;
+    if (!r || !r.state?.al) {
+      this.bountyBeam?.setEnabled(false);
+      return;
+    }
+    if (!this.bountyBeam) {
+      this.bountyBeam = MeshBuilder.CreateCylinder("bountyBeam", { diameter: 1.6, height: 70, tessellation: 10 }, g.scene);
+      const m = this.glow("bountyBeam", "#ffd60a", 0.3);
+      m.alphaMode = 1; // additive
+      this.bountyBeam.material = m;
+      this.bountyBeam.isPickable = false;
+      this.flagMeshes.push(this.bountyBeam);
+    }
+    this.bountyBeam.setEnabled(true);
+    this.bountyBeam.position.set(r.player.pos.x, r.player.pos.y + 40, r.player.pos.z);
+  }
+
+  // ---- Turrets ----
+
+  /** When the host last reported each flag's turret destroyed. */
+  private turretGone = new Map<number, number>();
+
+  private turretColor(owner: number) {
+    return owner > 0 ? this.infos.get(owner)?.color ?? NEUTRAL_TURRET : NEUTRAL_TURRET;
+  }
+
+  /** The host keeps a turret on each flag that should have one, in its owner's colours. */
+  private runTurrets() {
+    const g = this.g;
+    const turrets = new Map(g.enemies.list.filter((e) => e.kind === "turret" && e.remoteBot === undefined).map((e) => [e.turretFlag!, e]));
+    this.flags.forEach((f, i) => {
+      const e = turrets.get(i);
+      if (f.turret === null || f.turret === undefined) {
+        if (e) g.enemies.dropRemoteBot(e, g, true);
+        return;
+      }
+      if (!e) {
+        if (this.time - (this.turretGone.get(i) ?? -9) < 3) return;
+        const flag = FLAGS[i];
+        g.enemies.spawnTurret(i, turretSpot(flag.at, flag.y, flag.radius), f.turret, this.turretColor(f.turret));
+      } else if (e.turretOwner !== f.turret) g.enemies.setTurretOwner(e, f.turret, this.turretColor(f.turret));
+    });
+  }
+
+  /** B on our own flag with no turret: put up ours, if we have the points. */
+  private buyTurret() {
+    const g = this.g, p = g.player;
+    const here = FLAGS.findIndex((f) => inZone(f, p.pos.x, p.pos.y, p.pos.z));
+    const f = this.flags[here];
+    if (!f || f.owner !== this.me || f.turret !== null) return;
+    if (this.mine.score < TURRET_COST) return g.hud.banner(`Турель стоит ${TURRET_COST} очков`, 1.5);
+    this.net.send({ t: "turret", flag: here });
+  }
+
   // ---- Bots ----
 
   /**
-   * The robot a bot at `pos` goes for: the nearest player still standing and not just back from
-   * the dead (us included). With nobody to fight it holds its fire.
+   * The robot a bot at `pos` goes for, among the players still standing and not just back from the
+   * dead (us included): mostly the nearest, but one it can see beats one behind a wall, a damaged one
+   * is finished off, and the leader draws fire. With nobody to fight it holds its fire.
    */
-  targetFor(pos: Vector3) {
+  targetFor(pos: Vector3, turretOwner?: number) {
     const g = this.g, p = g.player;
-    let best = { chest: p.chest(), vel: p.velocity, alive: p.alive && this.guard === 0 };
-    let bestD = best.alive ? Vector3.DistanceSquared(pos, best.chest) : Infinity;
+    // A player's turret spares them; a neutral one (or a bot) goes for anyone.
+    const spare = turretOwner !== undefined && turretOwner > 0 ? turretOwner : null;
+    const top = [...this.infos.values()].reduce((a, b) => (b.score > a.score ? b : a));
+    // Only a real lead counts, not the first few points.
+    const leader = top.score > 50 ? top.id : null;
+    const cost = (id: number, chest: Vector3, hp: number) => {
+      const d = Vector3.Distance(pos, chest);
+      const seen = d < 120 && g.city.lineOfSight(pos, chest);
+      return d - (seen ? 45 : 0) - (hp < 70 ? 20 : 0) - (id === leader ? 15 : 0);
+    };
+    let best = { chest: p.chest(), vel: p.velocity, alive: p.alive && this.guard === 0 && spare !== this.me };
+    let bestCost = best.alive ? cost(this.me, best.chest, p.hp + p.shield) : Infinity;
     for (const r of this.remotes.values()) {
       const s = r.state;
-      if (!s || !s.al || s.pr) continue;
+      if (!s || !s.al || s.pr || r.info.id === spare) continue;
       const chest = r.player.chest();
-      const d = Vector3.DistanceSquared(pos, chest);
-      if (d < bestD) {
-        bestD = d;
+      const c = cost(r.info.id, chest, s.hp);
+      if (c < bestCost) {
+        bestCost = c;
         best = { chest, vel: new Vector3(s.vx, 0, s.vz), alive: true };
       }
     }
@@ -447,22 +564,22 @@ export class Arena {
   }
 
   /** Another player in the way of a bot's shot (host only), or null. */
-  hitRemote(a: Vector3, b: Vector3) {
+  hitRemote(a: Vector3, b: Vector3, spare?: number) {
     for (const r of this.remotes.values()) {
-      if (!r.state?.al || r.state.pr) continue;
+      if (!r.state?.al || r.state.pr || r.info.id === spare) continue;
       if (r.player.hitSpheres().some(([c, rad]) => segSphere(a, b, c, rad))) return r.info.id;
     }
     return null;
   }
 
   /** A bot's shot hit us (we are the host): if it brings us down, the bots get the kill. */
-  hitByBot() {
-    this.lastHit = { id: BOTS, t: this.time };
+  hitByBot(by?: number) {
+    this.lastHit = { id: by ?? BOTS, t: this.time };
   }
 
   /** A bot's shot hit another player (host only). */
-  botHurt(id: number, dmg: number) {
-    this.net.send({ t: "bothurt", to: id, dmg: Math.round(dmg * 100) / 100 });
+  botHurt(id: number, dmg: number, by?: number) {
+    this.net.send({ t: "bothurt", to: id, dmg: Math.round(dmg * 100) / 100, by });
   }
 
   /** Our shot hit one of the host's bots. */
@@ -472,35 +589,45 @@ export class Arena {
 
   /** A bot went down in our game (we are the host): whoever hit it last gets the points. */
   botKilled(e: Enemy) {
-    this.net.send({ t: "botkill", killer: e.by ?? this.me });
+    if (e.kind === "turret") {
+      // Until the server says so, the flag still lists it: no new one meanwhile.
+      this.turretGone.set(e.turretFlag!, this.time);
+      this.net.send({ t: "turretdown", flag: e.turretFlag!, killer: e.by ?? this.me });
+    }
+    else this.net.send({ t: "botkill", killer: e.by ?? this.me });
   }
 
   /** The host keeps the bots coming, sends them roaming between the players, and tells everyone where they are. */
   private runBots(dt: number) {
     const g = this.g;
-    const bots = g.enemies.list.filter((e) => e.pilot === undefined && e.remoteBot === undefined);
+    this.runTurrets();
+    const bots = g.enemies.list.filter((e) => e.pilot === undefined && e.remoteBot === undefined && e.kind !== "turret");
     const want = Math.min(BOTS_MAX, BOTS_BASE + BOTS_PER_PLAYER * this.infos.size);
     this.botT -= dt;
     if (bots.length < want && this.botT <= 0) {
       this.botT = BOT_SPAWN_EVERY;
       g.enemies.spawnBot(g);
     }
-    // The street routes lead to one player at a time, a different one every few seconds.
+    // The street routes lead to one player at a time, a different one every few seconds; half the
+    // time the one in the lead, so nobody runs away with the round.
     this.navT -= dt;
     if (this.navT <= 0) {
-      this.navT = 8;
-      const spots = [g.player.pos, ...[...this.remotes.values()].filter((r) => r.state?.al).map((r) => r.player.pos)];
-      this.navTarget = spots[Math.floor(Math.random() * spots.length)].clone();
+      this.navT = 6;
+      const alive = [{ id: this.me, pos: g.player.pos, ok: g.player.alive }, ...[...this.remotes.values()].map((r) => ({ id: r.info.id, pos: r.player.pos, ok: !!r.state?.al }))].filter((x) => x.ok);
+      const leader = [...this.infos.values()].reduce((a, b) => (b.score > a.score ? b : a)).id;
+      const chase = alive.find((x) => x.id === leader && Math.random() < 0.5) ?? alive[Math.floor(Math.random() * alive.length)];
+      if (chase) this.navTarget = chase.pos.clone();
     }
     this.botSendT -= dt;
     if (this.botSendT > 0) return;
     this.botSendT = BOT_SEND;
     const r = (n: number) => Math.round(n * 10) / 10;
-    const list: BotState[] = bots.map((e) => {
+    const ours = g.enemies.list.filter((e) => e.pilot === undefined && e.remoteBot === undefined);
+    const list: BotState[] = ours.map((e) => {
       const fired = e.fired ?? 0;
       e.fired = 0;
       const aim = e.aim ?? e.pos;
-      return [e.netId!, e.kind, r(e.pos.x), r(e.pos.y), r(e.pos.z), r(e.yaw), fired, r(aim.x), r(aim.y), r(aim.z)];
+      return [e.netId!, e.kind, r(e.pos.x), r(e.pos.y), r(e.pos.z), r(e.yaw), fired, r(aim.x), r(aim.y), r(aim.z), e.turretFlag];
     });
     this.net.send({ t: "bots", list });
   }
@@ -510,11 +637,17 @@ export class Arena {
     const g = this.g;
     const copies = new Map(g.enemies.list.filter((e) => e.remoteBot !== undefined).map((e) => [e.remoteBot!, e]));
     const seen = new Set<number>();
-    for (const [id, kind, x, y, z, yaw, fired, ax, ay, az] of list) {
-      if (!Enemies.BOT_KINDS.includes(kind as Kind)) continue;
+    for (const [id, kind, x, y, z, yaw, fired, ax, ay, az, flag] of list) {
+      if (!Enemies.BOT_KINDS.includes(kind as Kind) && kind !== "turret") continue;
       seen.add(id);
       let e = copies.get(id);
       if (!e) e = g.enemies.addRemoteBot(id, kind as Kind, x, y, z, yaw);
+      // A turret's copy shows whose it is.
+      if (kind === "turret" && flag !== undefined) {
+        const owner = this.flags[flag]?.turret ?? WORLD;
+        if (e.turretOwner !== owner) g.enemies.setTurretOwner(e, owner, this.turretColor(owner));
+        e.turretFlag = flag;
+      }
       e.netPos!.set(x, y, z);
       e.netYaw = yaw;
       if (fired) g.enemies.showShots(e, fired, new Vector3(ax, ay, az), g);
@@ -717,15 +850,30 @@ export class Arena {
     }
     const aim = new Vector3(s.ax, s.ay, s.az);
     const firing = s.f && s.al;
-    p.pose(dt, aim, firing);
+    const weapon: Primary = PRIMARY_LIST.includes(s.w as Primary) ? (s.w as Primary) : "guns";
+    p.pose(dt, aim, firing && weapon === "guns");
     // A robot just back from the dead blinks while nothing can hurt it.
     const enemy = g.enemies.list.find((x) => x.pilot === r.info.id);
     if (enemy && s.pr) enemy.flashT = Math.sin(this.time * 18) > 0 ? 0.05 : 0;
     // Their shots, for show: the damage is dealt by their game.
-    if (firing && !s.sp) {
+    g.arsenal.fire(r.info.id, weapon, dt, firing && !s.sp, p, aim, g, false);
+    if (firing && !s.sp && weapon === "guns") {
       const shot = p.fire(dt, true);
       if (shot) g.projectiles.spawn(shot.from, shot.dir.scale(BULLET_SPEED), "tracer", 0);
     }
+    // Their minigun, for show: the same forty rounds a second.
+    r.miniT = (r.miniT ?? 0) - dt;
+    if (firing && s.sp === "minigun") {
+      const near = Vector3.Distance(p.pos, g.player.pos);
+      while (r.miniT <= 0) {
+        r.miniT += 0.025;
+        r.gun = 1 - r.gun;
+        const from = p.guns[r.gun].muzzlePosition();
+        const dir = aim.subtract(from).normalize().addInPlaceFromFloats((Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06).normalize();
+        g.projectiles.spawn(from, dir.scale(BULLET_SPEED), "tracer", 0);
+        if (r.gun) g.sfx.minigun(near);
+      }
+    } else r.miniT = Math.max(r.miniT, 0);
     const lasing = firing && s.sp === "laser";
     if (lasing) r.beams ??= [new LaserBeam(g.scene), new LaserBeam(g.scene)];
     p.guns.forEach((gun, i) => {
@@ -874,7 +1022,8 @@ export class Arena {
     if (f && g.player.alive) {
       const name = FLAGS[here].name;
       if (f.contested) text = `Флаг ${name} оспаривается!`;
-      else if (f.owner === this.me) text = `Флаг ${name} твой`;
+      else if (f.owner === this.me)
+        text = f.turret === null ? `Флаг ${name} твой · B — поставить турель (${TURRET_COST})` : `Флаг ${name} твой`;
       else if (f.taker === this.me) text = `Захват флага ${name}: ${Math.round(f.progress * 100)}%`;
       else text = `Захват флага ${name}…`;
     }
@@ -892,6 +1041,30 @@ export class Arena {
 
   /** The minimap: our tripwires, and each flag as a letter in its owner's colour. Coins and weapons are for finding. */
   drawMap(c: CanvasRenderingContext2D, px: (x: number) => number, pz: (z: number) => number) {
+    // The leader, whom everyone hunts: the only player on the map (a pulsing gold star in their colour).
+    const lead = this.leader !== null ? this.remotes.get(this.leader) : undefined;
+    if (lead?.state?.al) {
+      const x = px(lead.player.pos.x), y = pz(lead.player.pos.z), r = 6 + Math.sin(this.time * 6) * 1.5;
+      c.fillStyle = "#ffd60a";
+      c.beginPath();
+      for (let i = 0; i < 10; i++) {
+        const a = (i / 10) * Math.PI * 2 - Math.PI / 2, d = i % 2 ? r * 0.45 : r;
+        c.lineTo(x + Math.cos(a) * d, y + Math.sin(a) * d);
+      }
+      c.closePath();
+      c.fill();
+      c.strokeStyle = lead.info.color;
+      c.lineWidth = 1.5;
+      c.stroke();
+    }
+    // A drop pod on its way down or waiting: the one thing worth marking.
+    for (const k of this.g.loot.crates) {
+      if (!k.drop || k.opened >= 0) continue;
+      c.fillStyle = Math.sin(this.time * 8) > 0 ? "#ffd60a" : "#fff3a0";
+      c.beginPath();
+      c.arc(px(k.pos.x), pz(k.pos.z), 6, 0, Math.PI * 2);
+      c.fill();
+    }
     c.strokeStyle = "#ff5a5a";
     c.lineWidth = 2;
     for (const m of this.mines.values()) {

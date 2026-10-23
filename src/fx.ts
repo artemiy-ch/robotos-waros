@@ -196,6 +196,22 @@ export class Fx {
     return ps;
   }
 
+  /** A flamethrower's stream: the caller aims it (emitter, directions) and turns it on (emitRate). */
+  flamer() {
+    return this.makeSystem("flamer", 400, this.puffTex, (s) => {
+      s.addColorGradient(0, new Color4(1, 0.9, 0.55, 0.95));
+      s.addColorGradient(0.35, new Color4(1, 0.45, 0.1, 0.8));
+      s.addColorGradient(1, new Color4(0.2, 0.08, 0.05, 0));
+      s.addSizeGradient(0, 0.4);
+      s.addSizeGradient(1, 3.2);
+      s.minLifeTime = 0.3;
+      s.maxLifeTime = 0.45;
+      s.minEmitPower = 52;
+      s.maxEmitPower = 64;
+      s.blendMode = ParticleSystem.BLENDMODE_ADD;
+    });
+  }
+
   /** A cloud of dust rolling out of a collapsing building's footprint. */
   dustCloud(at: Vector3, w: number, d: number) {
     const dust = this.makeSystem("collapseDust", 700, this.flare, (s) => {

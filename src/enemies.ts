@@ -5,8 +5,10 @@ import type { Mech, Models, RigName } from "./models";
 import type { ShotKind } from "./projectiles";
 import { approachAngle, clamp, raySphere, segSphere } from "./util";
 import { Gatling } from "./weapons";
+import { BURN_DPS, BURN_TIME } from "./primary";
+import { NEUTRAL_TURRET, TurretMech } from "./turret";
 
-export type Kind = "drone" | "kamikaze" | "heavyDrone" | "walker" | "gunner" | "titan" | "bossTitan" | "bossTitan2" | "carrier" | "flagship" | "pilot";
+export type Kind = "drone" | "kamikaze" | "heavyDrone" | "walker" | "gunner" | "titan" | "bossTitan" | "bossTitan2" | "carrier" | "flagship" | "pilot" | "turret";
 
 interface RigSpec {
   model: RigName;
@@ -59,15 +61,27 @@ export interface Spec {
   kamikaze?: { trigger: number; fuse: number; radius: number; dmg: number };
   /** The final boss: fights in phases and goes down in a long crash. */
   final?: boolean;
+  /** Stands guard on a flag (multiplayer): never moves, turns to shoot. */
+  turret?: boolean;
   /** Launches this many drones every few seconds, up to a limit; and kamikazes with them, up to their own limit. */
   launches?: { every: number; count: number; max: number; kamikaze?: { count: number; max: number } };
 }
 
+/** Height of another player's head (its own hit sphere: a shot through it is a headshot). */
+const PILOT_HEAD = 4.95;
+
 export const SPECS: Record<Kind, Spec> = {
+  // A flag's gun turret (multiplayer): its model is built from shapes (turret.ts), the cannon is a gatling.
+  turret: {
+    name: "Турель", hp: 150, speed: 0, radius: 1.6, score: 0, drop: 0, want: 0, range: 70,
+    dmg: 4, bulletSpeed: 70, burst: 5, cooldown: [1.2, 1.8], shot: "bolt", hit: [[2.4, 1.3], [0.8, 1.5]],
+    rig: { model: "Hero", scale: 1, gait: null, death: null, attack: null, hit: null, gatling: { at: [0, 0.2, 0.9], size: 1.3 } },
+    turret: true,
+  },
   // Another player in multiplayer: moved by the network, hit like a robot, damaged over the network.
   pilot: {
     name: "Пилот", hp: 100, speed: 0, radius: 1.3, score: 0, drop: 0, want: 0, range: 0,
-    dmg: 0, bulletSpeed: 1, burst: 0, cooldown: [9, 9], shot: "tracer", hit: [[3.4, 1.6], [1.4, 1.1]],
+    dmg: 0, bulletSpeed: 1, burst: 0, cooldown: [9, 9], shot: "tracer", hit: [[3.4, 1.6], [1.4, 1.1], [PILOT_HEAD, 0.7]],
     rig: { model: "Hero", scale: 0.42, gait: null, death: null, attack: null, hit: null },
   },
   drone: {
@@ -195,6 +209,14 @@ export interface Enemy {
   netYaw?: number;
   /** Seconds the copy's gun keeps spinning after a reported shot. */
   firingT?: number;
+  /** A turret: which flag it guards, and whose it is (WORLD for a neutral one). */
+  turretFlag?: number;
+  turretOwner?: number;
+  /** Seconds left on fire from a flamethrower, and when its flames next show. */
+  burnT?: number;
+  burnFx?: number;
+  /** Multiplayer bots are harder: faster on their feet, quicker to fire, better at leading their shots. */
+  edge?: { speed: number; rate: number; lead: number };
 }
 
 const DEATH_TIME = 1.1;
@@ -256,7 +278,7 @@ export class Enemies {
   private spawn(kind: Kind, x: number, z: number, y?: number) {
     const spec = SPECS[kind];
     const rig = spec.rig;
-    const mech = this.models.spawn(rig.model, rig.scale);
+    const mech = spec.turret ? new TurretMech(this.scene, this.shadows, NEUTRAL_TURRET).asMech() : this.models.spawn(rig.model, rig.scale);
     mech.anim.play("Idle", { instant: true });
     if (rig.tint) for (const m of mech.meshes) m.material = this.tint(m, rig.tint);
     // The flagship gets its own copy of the hull material, so it can glow red with rage.
@@ -308,6 +330,28 @@ export class Enemies {
     return m;
   }
 
+  /** Where one of an enemy's hit spheres is now. */
+  sphere(e: Enemy, sp: [number, number, number?]) {
+    return sphereAt(e, sp);
+  }
+
+  /** Set alight by our flamethrower (again: the fire lasts BURN_TIME from the last lick). */
+  ignite(e: Enemy) {
+    e.burnT = BURN_TIME;
+  }
+
+  /** Burning: our damage over time (other players' and bots' copies pass it on over the network). */
+  private burn(e: Enemy, dt: number, g: Game) {
+    if (!e.burnT || e.burnT <= 0 || e.hp <= 0) return;
+    e.burnT -= dt;
+    e.burnFx = (e.burnFx ?? 0) - dt;
+    if (e.burnFx <= 0) {
+      e.burnFx = 0.25;
+      g.fx.pop(this.centre(e).addInPlaceFromFloats((Math.random() - 0.5) * 1.5, 0, (Math.random() - 0.5) * 1.5));
+    }
+    this.damage(e, BURN_DPS * g.player.stats.gunDamage * dt, g, true);
+  }
+
   /** Where an enemy is aimed at: the middle of its main hit sphere. */
   centre(e: Enemy) {
     return sphereAt(e, e.spec.hit[0]);
@@ -320,6 +364,7 @@ export class Enemies {
   update(dt: number, g: Game) {
     const local = { chest: g.player.chest(), vel: g.player.velocity, alive: g.state === "playing" && g.player.alive };
     for (const e of this.list) {
+      this.burn(e, dt, g);
       if (e.pilot !== undefined) {
         e.flashT -= dt;
         e.mech.setFlash(e.flashT > 0);
@@ -330,13 +375,17 @@ export class Enemies {
         continue;
       }
       // In a room each robot goes for the nearest player; on its own, for ours.
-      const goal = g.arena ? g.arena.targetFor(e.pos) : local;
+      const goal = g.arena ? g.arena.targetFor(e.pos, e.turretOwner) : local;
       const target = goal.chest;
       const canFire = goal.alive;
       const spec = e.spec;
       const flying = !spec.rig.gait;
       e.phase += dt;
       e.hitAnimT -= dt;
+      if (spec.turret) {
+        this.guard(e, dt, g, goal);
+        continue;
+      }
       if (e.stunT > 0) {
         this.daze(e, dt);
         continue;
@@ -379,7 +428,7 @@ export class Enemies {
         mz /= ml;
       }
       const k = 1 - Math.exp(-3 * dt);
-      const speed = spec.final && e.stage >= 3 ? spec.speed * 1.6 : spec.boss ? spec.speed : spec.speed * PACE;
+      const speed = (spec.final && e.stage >= 3 ? spec.speed * 1.6 : spec.boss ? spec.speed : spec.speed * PACE) * (e.edge?.speed ?? 1);
       e.vel.x += (mx * speed - e.vel.x) * k;
       e.vel.z += (mz * speed - e.vel.z) * k;
       for (const o of this.list) {
@@ -450,7 +499,7 @@ export class Enemies {
       if (los && dist < spec.range && e.fireCd <= 0) {
         e.burst = spec.burst;
         e.burstT = 0;
-        e.fireCd = spec.cooldown[0] + Math.random() * (spec.cooldown[1] - spec.cooldown[0]);
+        e.fireCd = (spec.cooldown[0] + Math.random() * (spec.cooldown[1] - spec.cooldown[0])) * (e.edge?.rate ?? 1);
         if (spec.rig.attack) e.mech.anim.oneShot(spec.rig.attack);
       }
       e.burstT -= dt;
@@ -617,7 +666,7 @@ export class Enemies {
     const spread = 0.04;
     // Aim where the player is going to be (about two thirds of the way).
     const lead = Vector3.Distance(e.pos, chest) / Math.max(1, e.spec.bulletSpeed);
-    const target = chest.add(vel.scale(lead * 0.65));
+    const target = chest.add(vel.scale(lead * (e.edge?.lead ?? 0.65)));
     // Told to the other players, so their copies of this robot fire too.
     e.fired = (e.fired ?? 0) + 1;
     e.aim = target;
@@ -636,12 +685,20 @@ export class Enemies {
     } else from = e.pos.add(target.subtract(e.pos).normalize().scale(e.spec.radius + 0.3));
     const dir = target.subtract(from).normalize();
     dir.addInPlaceFromFloats((Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread).normalize();
-    g.projectiles.spawn(from, dir.scale(e.spec.bulletSpeed), e.spec.shot, e.spec.dmg * e.dmgScale);
+    // A player's turret fires on their behalf: its kills are theirs.
+    const by = e.turretOwner !== undefined && e.turretOwner > 0 ? e.turretOwner : undefined;
+    g.projectiles.spawn(from, dir.scale(e.spec.bulletSpeed), e.spec.shot, e.spec.dmg * e.dmgScale, 2, by);
     g.sfx.enemyShoot(Vector3.Distance(e.pos, g.player.pos), e.spec.shot === "plasma");
   }
 
   /** `quiet` skips the hit click (the laser hits every frame). */
-  damage(e: Enemy, dmg: number, g: Game, quiet = false) {
+  /** Whether a shot from a to b goes through another player's head. */
+  headshot(e: Enemy, a: Vector3, b: Vector3) {
+    return e.pilot !== undefined && segSphere(a, b, sphereAt(e, [PILOT_HEAD, 0.7]), 0.7);
+  }
+
+  /** `head`: it was a headshot (another player, multiplayer). */
+  damage(e: Enemy, dmg: number, g: Game, quiet = false, head = false) {
     if (e.remoteBot !== undefined) {
       // The host's robot: the host's game takes the damage.
       if (dmg <= 0) return;
@@ -654,7 +711,8 @@ export class Enemies {
     if (e.pilot !== undefined) {
       // Only the shooter's own hits count (others' shots are just for show); the victim's game takes the damage.
       if (dmg <= 0) return;
-      g.arena?.hitPilot(e.pilot, dmg);
+      g.arena?.hitPilot(e.pilot, dmg, head);
+      if (head) g.popup(sphereAt(e, [PILOT_HEAD + 1, 0]), "Хедшот", false);
       e.flashT = 0.08;
       g.hud.hitMarker();
       if (!quiet) g.sfx.hit();
@@ -845,9 +903,11 @@ export class Enemies {
 
   /** The host adds a bot somewhere away from the action. */
   spawnBot(g: Game) {
-    this.hpScale = 1.5;
-    this.dmgScale = 1;
+    this.hpScale = 1.5 * 1.25; // a quarter more than in the waves
+    this.dmgScale = 1.25;
+    const before = this.list.length;
     this.spawnAwayFrom(g, Enemies.BOT_KINDS[Math.floor(Math.random() * Enemies.BOT_KINDS.length)]);
+    if (this.list.length > before) this.list[this.list.length - 1].edge = { speed: 1.3, rate: 0.5, lead: 0.75 };
   }
 
   /** A copy of one of the host's bots. */
@@ -908,6 +968,54 @@ export class Enemies {
       g.projectiles.spawn(from, dir.scale(e.spec.bulletSpeed), e.spec.shot, 0);
     }
     if (count) g.sfx.enemyShoot(Vector3.Distance(e.pos, g.player.pos), e.spec.shot === "plasma");
+  }
+
+  /** A turret on a flag (the host's), neutral or a player's. */
+  spawnTurret(flag: number, at: Vector3, owner: number, color: string) {
+    this.spawn("turret", at.x, at.z, at.y);
+    const e = this.list[this.list.length - 1];
+    e.hp = SPECS.turret.hp;
+    e.dmgScale = 1;
+    e.turretFlag = flag;
+    this.setTurretOwner(e, owner, color);
+    return e;
+  }
+
+  setTurretOwner(e: Enemy, owner: number, color: string) {
+    e.turretOwner = owner;
+    (e.mech as unknown as TurretMech).setColor(color);
+  }
+
+  /** A turret's turn: swing round to whoever it is after, and fire bursts while it can see them. */
+  private guard(e: Enemy, dt: number, g: Game, goal: { chest: Vector3; vel: Vector3; alive: boolean }) {
+    const spec = e.spec;
+    const eye = this.eye(e);
+    const to = goal.chest.subtract(eye);
+    const dist = to.length();
+    const sees = goal.alive && dist < spec.range && g.city.lineOfSight(eye, goal.chest);
+    if (sees) e.yaw = approachAngle(e.yaw, Math.atan2(to.x, to.z), dt * 3);
+    e.mech.root.position.copyFrom(e.pos);
+    e.mech.root.rotation.y = e.yaw;
+    if (e.gatling) {
+      this.mountGatling(e);
+      e.gatling.aimAt(goal.chest, e.yaw, 0.9);
+      e.gatling.update(dt, e.burst > 0);
+    }
+    e.flashT -= dt;
+    e.mech.setFlash(e.flashT > 0);
+    e.fireCd -= dt;
+    e.burstT -= dt;
+    if (!sees) return;
+    if (e.fireCd <= 0) {
+      e.burst = spec.burst;
+      e.burstT = 0;
+      e.fireCd = spec.cooldown[0] + Math.random() * (spec.cooldown[1] - spec.cooldown[0]);
+    }
+    if (e.burst > 0 && e.burstT <= 0) {
+      this.fire(e, goal.chest, g, goal.vel);
+      e.burst--;
+      e.burstT = 0.12;
+    }
   }
 
   /** Another player's robot joins the list (multiplayer); its model belongs to the caller. */

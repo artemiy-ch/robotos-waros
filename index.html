@@ -77,40 +77,60 @@
 
     <div id="overlay">
       <div class="card">
-        <h1 id="ov-title">ROBOT WARS</h1>
-        <p id="ov-text"></p>
-        <div id="pilot" class="hidden">
-          <div class="modes">
-            <button type="button" class="mode selected" data-mode="solo">Одиночная</button>
-            <button type="button" class="mode" data-mode="mp">Мультиплеер</button>
-          </div>
-          <div id="mp-menu" class="hidden">
-            <button type="button" id="mp-create" class="mp-button">Создать комнату</button>
-            <span class="mp-or">или</span>
-            <input id="mp-code" type="text" maxlength="4" placeholder="КОД" autocomplete="off" spellcheck="false" />
-            <button type="button" id="mp-join" class="mp-button">Войти</button>
-            <div id="mp-status"></div>
-          </div>
-          <input id="nick" type="text" maxlength="16" placeholder="Твой ник" autocomplete="off" spellcheck="false" />
-          <div class="skins">
-            <button type="button" class="skin" data-skin="dark"><i></i>Тёмный</button>
-            <button type="button" class="skin" data-skin="light"><i></i>Светлый</button>
-            <button type="button" class="skin" data-skin="rainbow"><i></i>Радуга</button>
+        <div class="card-cols">
+          <aside class="guide">
+            <h2>Управление</h2>
+            <ul class="controls">
+              <li><kbd>W A S D</kbd> движение</li>
+              <li><kbd>Shift</kbd> бег</li>
+              <li><kbd>Пробел</kbd> полёт</li>
+              <li><kbd>Q</kbd> в воздухе — удар о землю</li>
+              <li><kbd>M</kbd> музыка</li>
+              <li><kbd>Мышь</kbd> прицел</li>
+              <li><kbd>ЛКМ</kbd> стрельба</li>
+              <li><kbd>E</kbd> залп ракет</li>
+              <li><kbd>ПКМ</kbd> шаурмомёт</li>
+              <li><kbd>Колесо</kbd> зум</li>
+              <li><kbd>Esc</kbd> пауза</li>
+            </ul>
+            <h2>Как играть</h2>
+            <ul class="rules">
+              <li>Ящики с цветным лучом — временная пушка: лазер, тесла или шаурмбастер.</li>
+              <li>С высоты жми <kbd>Q</kbd> — удар о землю раскидывает всех вокруг.</li>
+              <li><b>Одиночная:</b> волны роботов, каждая пятая с боссом. После волны — улучшение на выбор (<kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd>).</li>
+              <li><b>Мультиплеер:</b> захватывай флаги A–I, часть на крышах. Флаг даёт +1 очко в секунду, сбитый игрок +15, бот +5. Побеждает первый до 1000.</li>
+              <li>На флагах стоят турели — бьют всех, их можно разбить (+20). На своём флаге <kbd>B</kbd> ставит твою турель за 60 очков.</li>
+              <li>Монеты +10, каждые 100 — улучшение. Красная катушка — растяжка: <kbd>F</kbd> поставить, <kbd>R</kbd> повернуть.</li>
+              <li>Сбили — через 5 секунд снова в бою на своём флаге, 4 секунды неуязвимости.</li>
+            </ul>
+          </aside>
+          <div class="setup">
+            <h1 id="ov-title">ROBOT WARS</h1>
+            <p id="ov-text"></p>
+            <div id="pilot" class="hidden">
+              <div class="modes">
+                <button type="button" class="mode selected" data-mode="solo">Одиночная</button>
+                <button type="button" class="mode" data-mode="mp">Мультиплеер</button>
+              </div>
+              <div id="mp-menu" class="hidden">
+                <button type="button" id="mp-create" class="mp-button">Создать комнату</button>
+                <span class="mp-or">или</span>
+                <input id="mp-code" type="text" maxlength="4" placeholder="КОД" autocomplete="off" spellcheck="false" />
+                <button type="button" id="mp-join" class="mp-button">Войти</button>
+                <div id="mp-status"></div>
+              </div>
+              <input id="nick" type="text" maxlength="16" placeholder="Твой ник" autocomplete="off" spellcheck="false" />
+              <div class="skins">
+                <button type="button" class="skin" data-skin="dark"><i></i>Тёмный</button>
+                <button type="button" class="skin" data-skin="light"><i></i>Светлый</button>
+                <button type="button" class="skin" data-skin="rainbow"><i></i>Радуга</button>
+              </div>
+              <div id="weapons" class="weapons"></div>
+            </div>
+            <button type="button" id="start" class="start-button">В бой!</button>
+            <div class="start-hint">или <kbd>Enter</kbd></div>
           </div>
         </div>
-        <ul class="controls">
-          <li><kbd>W A S D</kbd> движение</li>
-          <li><kbd>Shift</kbd> бег</li>
-          <li><kbd>Пробел</kbd> полёт</li>
-          <li><kbd>Q</kbd> в воздухе — удар о землю</li>
-          <li><kbd>M</kbd> музыка</li>
-          <li><kbd>Мышь</kbd> прицел</li>
-          <li><kbd>ЛКМ</kbd> пулемёты</li>
-          <li><kbd>E</kbd> залп ракет</li>
-          <li><kbd>ПКМ</kbd> шаурмомёт</li>
-          <li><kbd>Колесо</kbd> зум</li>
-          <li><kbd>Esc</kbd> пауза</li>
-        </ul>
         <p class="credits">
           Модели: герой — <a href="https://poly.pizza/m/BwjA6Thdzd" target="_blank" rel="noopener" onclick="event.stopPropagation()">«Rigged robot» by joney_lol</a>
           (<a href="https://creativecommons.org/licenses/by/3.0/" target="_blank" rel="noopener" onclick="event.stopPropagation()">CC BY 3.0</a>) ·

@@ -8,7 +8,7 @@ const MUSIC_VOLUME = 0.37;
 const CROSSFADE = 2.5;
 
 /** Recorded effects in public/sfx (generated with ElevenLabs Sound Effects). */
-const SAMPLES = ["gun", "rocket", "explosion", "explosion_big", "step_a", "step_b", "land", "laser", "powerup", "thunder_near", "thunder_far", "slam", "boss", "tesla", "warp", "victory"] as const;
+const SAMPLES = ["gun", "rocket", "explosion", "explosion_big", "step_a", "step_b", "land", "laser", "powerup", "thunder_near", "thunder_far", "slam", "boss", "tesla", "warp", "victory", "shotgun", "rail", "flame"] as const;
 type Sample = (typeof SAMPLES)[number];
 
 /**
@@ -215,7 +215,7 @@ export class Sfx {
 
   shoot() {
     // Cut short and slightly detuned each time, so 14 shots a second stay crisp and don't sound looped.
-    if (this.play("gun", 0.675, 0.9 + Math.random() * 0.2, 0.2)) return;
+    if (this.play("gun", 0.5, 0.9 + Math.random() * 0.2, 0.2)) return;
     this.burst(0.06, 2400 + Math.random() * 800, "highpass", 0.22);
     this.burst(0.09, 400, "lowpass", 0.35);
     this.tone(520 + Math.random() * 80, 90, 0.07, "square", 0.06);
@@ -225,6 +225,41 @@ export class Sfx {
     if (this.play("rocket", vol, 0.95 + Math.random() * 0.1)) return;
     this.burst(0.5, 1200, "bandpass", 0.35);
     this.tone(200, 900, 0.3, "sawtooth", 0.04);
+  }
+
+  /** The shotgun: a deep boom with a rattle of shot. */
+  shotgun(dist = 0) {
+    const v = Math.max(0.1, 1 - dist / 120);
+    if (this.play("shotgun", 0.9 * v, 0.95 + Math.random() * 0.1)) return;
+    this.burst(0.18, 500, "lowpass", 0.5 * v);
+    this.burst(0.08, 2600, "highpass", 0.2 * v);
+    this.tone(160, 50, 0.2, "square", 0.1 * v);
+  }
+
+  /** The railgun: a charged crack and a falling whine. */
+  rail(dist = 0) {
+    const v = Math.max(0.1, 1 - dist / 150);
+    if (this.play("rail", 0.8 * v, 0.97 + Math.random() * 0.06)) return;
+    this.tone(2400, 180, 0.35, "sawtooth", 0.08 * v);
+    this.burst(0.06, 4000, "highpass", 0.3 * v);
+  }
+
+  /** The minigun: the cannon's crack pitched down, cut short, for forty rounds a second. */
+  minigun(dist = 0) {
+    const v = Math.max(0.05, 1 - dist / 120);
+    if (this.play("gun", 0.45 * v, 0.72 + Math.random() * 0.06, 0.09)) return;
+    this.burst(0.05, 1800, "highpass", 0.15 * v);
+  }
+
+  /** Our flamethrower's steady roar while it fires. */
+  flameLoop(on: boolean) {
+    this.loop("flame", on, 0.55);
+  }
+
+  /** Another player's flamethrower roaring (one short gust per tick while it fires). */
+  flame(dist = 0) {
+    const v = Math.max(0.05, 1 - dist / 80);
+    this.burst(0.14, 700, "lowpass", 0.22 * v);
   }
 
   enemyShoot(dist: number, heavy: boolean) {

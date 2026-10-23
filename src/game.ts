@@ -24,6 +24,7 @@ import { Input } from "./input";
 import { Loot } from "./loot";
 import { Models } from "./models";
 import { Net } from "./net";
+import { Arsenal, PRIMARY_LIST, type Primary } from "./primary";
 import { Pickups } from "./pickups";
 import { Props } from "./props";
 import { FIRE_INTERVAL, Player } from "./player";
@@ -122,7 +123,11 @@ const DUSK_TIME = 5;
 /** Waves 1–2 by day, 3–4 by night, and so on. */
 const isDay = (wave: number) => Math.floor((Math.max(1, wave) - 1) / 2) % 2 === 0;
 
-const SOLO_INVITE = "Город захвачен роботами. Кликни, чтобы начать";
+/** The minigun: seconds between rounds, and each round's damage against a machine-gun round. */
+const MINIGUN_INTERVAL = 0.025;
+const MINIGUN_DAMAGE = 1.1;
+
+const SOLO_INVITE = "Город захвачен роботами";
 
 const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
@@ -154,6 +159,9 @@ export class Game {
   loot!: Loot;
   private beams: LaserBeam[];
   readonly shawarma: Shawarma;
+  /** The left-button weapon picked on the start screen (the machine guns, or one of the arsenal's). */
+  readonly arsenal: Arsenal;
+  primary: Primary = "guns";
   readonly lightning: Lightning;
   /** Multiplayer: the room we are in (null in the single-player game), and which game the start screen is set to. */
   arena: Arena | null = null;
@@ -163,6 +171,8 @@ export class Game {
   private teslaGun = 0;
   private busterT = 0;
   private busterGun = 0;
+  private miniT = 0;
+  private miniGun = 0;
   private hemiBase = HEMI_INTENSITY;
   /** 1 by day, 0 by night, in between at dusk and dawn; and where it is heading. */
   private daylight = 1;
@@ -255,14 +265,21 @@ export class Game {
     this.beams = [new LaserBeam(scene), new LaserBeam(scene)];
     this.lightning = new Lightning(scene);
     this.shawarma = new Shawarma(scene);
+    this.arsenal = new Arsenal(scene);
     this.models = new Models(scene, shadows);
     this.hud.onOverlayClick((e) => this.onOverlayClick(e));
+    // Enter does what the start button does.
+    window.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || !this.hud.canStart) return;
+      e.preventDefault();
+      this.begin();
+    });
     this.fx.onExplosion = (at, scale) => {
       this.destruction.scrap(at, scale);
       const dist = Vector3.Distance(at, this.player?.pos ?? at);
       this.hud.flash(Math.max(0, 0.6 - dist / 90) * Math.min(scale, 2));
     };
-    this.hud.showOverlay("ROBOT WARS", "Загрузка…");
+    this.overlay("ROBOT WARS", "Загрузка…");
     window.addEventListener("resize", () => this.engine.resize());
 
     void this.init();
@@ -294,15 +311,31 @@ export class Game {
         // Not remembered, then.
       }
     });
+    let weapon: string | null = null;
+    try {
+      weapon = localStorage.getItem("weapon");
+    } catch {
+      // No storage here.
+    }
+    this.primary = PRIMARY_LIST.includes(weapon as Primary) ? (weapon as Primary) : "guns";
+    this.hud.setupWeapons(this.primary, (w) => {
+      this.primary = w;
+      try {
+        localStorage.setItem("weapon", w);
+      } catch {
+        // Not remembered, then.
+      }
+    });
     this.hud.setupModes({
       mode: (mode) => {
         this.mode = mode;
         this.hud.overlayText(mode === "mp" ? "Создай комнату или введи код друга" : SOLO_INVITE);
+        this.updateStart();
       },
       create: () => this.startMultiplayer(null),
       join: (code) => this.startMultiplayer(code),
     });
-    this.hud.showOverlay("ROBOT WARS", SOLO_INVITE, true);
+    this.overlay("ROBOT WARS", SOLO_INVITE, true);
     // A link from a friend: straight into their room.
     const invited = new URLSearchParams(location.search).get("room");
     if (invited) {
@@ -370,6 +403,7 @@ export class Game {
     this.enemies.clear();
     this.projectiles.clear();
     this.shawarma.clear();
+    this.arsenal.clear();
     this.pickups.clear();
     this.fx.clearScorch();
     this.destruction.clear();
@@ -397,11 +431,34 @@ export class Game {
       target.textContent = "Скопировано";
       return;
     }
-    // In the multiplayer menu the game starts from a room, not from a click.
-    if (this.mode === "mp" && !this.arena) return;
+    this.begin();
+  }
+
+  /** Into the fight (or back into it): the start button, Enter, or a click on the menus. */
+  private begin() {
+    // In the multiplayer menu the game starts from a room.
+    if (this.state === "loading" || (this.mode === "mp" && !this.arena)) return;
     this.sfx.unlock();
     if (this.state === "dead" || this.state === "won") this.reset();
     this.input.lock();
+  }
+
+  /** The menus with the start button labelled for where we are (hidden where there is nothing to start yet). */
+  private overlay(title: string, html: string, pilot = false) {
+    this.hud.showOverlay(title, html, pilot);
+    this.updateStart();
+  }
+
+  private updateStart() {
+    const label =
+      this.state === "loading" || (this.mode === "mp" && !this.arena)
+        ? null
+        : this.state === "paused"
+          ? "Продолжить"
+          : this.state === "dead" || this.state === "won"
+            ? "Ещё раз"
+            : "В бой!";
+    this.hud.startButton(label);
   }
 
   // ---- Multiplayer ----
@@ -428,10 +485,10 @@ export class Game {
 
   private onServer(net: Net, msg: ServerMessage) {
     if (msg.t === "welcome") return this.enterArena(net, msg);
-    if (msg.t === "nope" || msg.t === "full") {
+    if (msg.t === "nope" || msg.t === "full" || msg.t === "old") {
       this.joining = null;
       net.close();
-      this.hud.mpStatus(msg.t === "nope" ? "Нет такой комнаты" : "Комната заполнена");
+      this.hud.mpStatus(msg.t === "nope" ? "Нет такой комнаты" : msg.t === "full" ? "Комната заполнена" : "Игра обновилась — обнови страницу (Ctrl+F5)");
       return;
     }
     this.arena?.onMessage(msg);
@@ -451,9 +508,9 @@ export class Game {
   }
 
   private showLobby() {
-    this.hud.showOverlay(
+    this.overlay(
       `Комната ${this.arena!.room}`,
-      `Позови друзей — отправь им ссылку:<br><span class="mp-link">${this.inviteLink()}</span> <button type="button" id="mp-copy" class="mp-button">Копировать</button><br>Захватывай флаги: кто первым наберёт очки, тот и победил.<br><b>Кликни, чтобы в бой</b><br><button type="button" id="mp-leave" class="mp-button">Выйти из комнаты</button>`,
+      `Позови друзей — отправь им ссылку:<br><span class="mp-link">${this.inviteLink()}</span> <button type="button" id="mp-copy" class="mp-button">Копировать</button><br>Захватывай флаги: кто первым наберёт очки, тот и победил.<br><button type="button" id="mp-leave" class="mp-button">Выйти из комнаты</button>`,
     );
   }
 
@@ -467,7 +524,7 @@ export class Game {
     if (document.pointerLockElement) document.exitPointerLock();
     this.reset();
     this.state = "menu";
-    this.hud.showOverlay("ROBOT WARS", reason ?? "Создай комнату или введи код друга", true);
+    this.overlay("ROBOT WARS", reason ?? "Создай комнату или введи код друга", true);
     this.hud.pickMode("mp");
   }
 
@@ -480,9 +537,10 @@ export class Game {
       this.sfx.jet(0);
       this.sfx.laser(false);
       this.sfx.tesla(false);
+      this.sfx.flameLoop(false);
       if (this.arena)
-        this.hud.showOverlay("Пауза", `Бой продолжается — тебя могут сбить!<br>Кликни, чтобы вернуться<br><button type="button" id="mp-leave" class="mp-button">Выйти из комнаты</button>`);
-      else this.hud.showOverlay("Пауза", "Кликни, чтобы продолжить");
+        this.overlay("Пауза", `Бой продолжается — тебя могут сбить!<br><button type="button" id="mp-leave" class="mp-button">Выйти из комнаты</button>`);
+      else this.overlay("Пауза", "");
     }
   }
 
@@ -503,7 +561,17 @@ export class Game {
     this.slowT = Math.max(this.slowT, seconds);
   }
 
+  /** One frame; an error in it is logged rather than left to stop every frame after it (Babylon queues the next one last). */
   private frame() {
+    try {
+      this.step();
+    } catch (err) {
+      console.error(err);
+      this.input.endFrame();
+    }
+  }
+
+  private step() {
     const real = Math.min(this.engine.getDeltaTime() / 1000, 0.05);
     if (this.hitstopT > 0) {
       this.hitstopT -= real;
@@ -564,7 +632,7 @@ export class Game {
     this.shake = Math.max(0, this.shake - dt * 2);
     player.updateCamera(this.camera, this.city, this.shake);
     const aim = this.aimPoint();
-    if (player.pose(dt, aim, this.trigger)) this.sfx.step(player.steps, input.down("ShiftLeft", "ShiftRight"));
+    if (player.pose(dt, aim, this.trigger && this.primary === "guns")) this.sfx.step(player.steps, input.down("ShiftLeft", "ShiftRight"));
     if (player.landed) {
       if (player.landed >= SLAM_SPEED) this.slam(player.landed);
       else {
@@ -583,16 +651,20 @@ export class Game {
     }
     this.sfx.jet(player.thrusting ? 1 : 0);
 
-    const shot = player.fire(dt, this.trigger);
+    const shot = player.fire(dt, this.trigger && this.primary === "guns");
     if (shot) {
       this.projectiles.spawn(shot.from, shot.dir.scale(BULLET_SPEED), "tracer", player.stats.gunDamage);
       this.fx.casing(shot.from.subtract(shot.dir.scale(1.2)), shot.right);
       this.sfx.shoot();
       this.shake = Math.min(this.shake + 0.04, 0.18);
     }
+    // The other starting weapons (a crate's weapon takes over the button while it lasts).
+    this.arsenal.fire(0, this.primary, dt, this.trigger && player.alive && !player.special, player, aim, this, true);
+    this.arsenal.update(dt, this);
     this.updateLaser(dt, aim);
     this.updateTesla(dt, aim);
     this.updateBuster(dt, aim);
+    this.updateMinigun(dt);
     this.shawarma.update(dt, input.alt && this.state === "playing" && player.stunT === 0, player.chest().addInPlaceFromFloats(0, 0.8, 0), aim, this);
     const rocket = player.rockets(dt, input.down("KeyE") && this.state === "playing");
     if (rocket) {
@@ -663,6 +735,25 @@ export class Game {
   }
 
   /** Arcs to the enemy nearest the crosshair, then on to up to three more around it. */
+  /** The minigun from a drop pod: forty rounds a second from both cannons, a touch wild. */
+  private updateMinigun(dt: number) {
+    const p = this.player;
+    this.miniT -= dt;
+    if (p.special !== "minigun" || !p.alive || !this.trigger) return;
+    while (this.miniT <= 0) {
+      this.miniT += MINIGUN_INTERVAL * p.stats.fireInterval;
+      this.miniGun = 1 - this.miniGun;
+      const gun = p.guns[this.miniGun];
+      gun.fire();
+      const from = gun.muzzlePosition();
+      const dir = gun.direction().addInPlaceFromFloats((Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.06).normalize();
+      this.projectiles.spawn(from, dir.scale(BULLET_SPEED), "tracer", p.stats.gunDamage * MINIGUN_DAMAGE);
+      if (this.miniGun) this.sfx.minigun();
+    }
+    this.miniT = Math.max(this.miniT, -0.05);
+    this.shake = Math.min(this.shake + 0.02, 0.22);
+  }
+
   /** The shawarma buster: shawarmas instead of bullets, from each gun in turn, a little harder than the machine guns. */
   private updateBuster(dt: number, aim: Vector3) {
     const p = this.player;
@@ -887,6 +978,7 @@ export class Game {
       this.sfx.jet(0);
       this.sfx.laser(false);
       this.sfx.tesla(false);
+      this.sfx.flameLoop(false);
       for (const b of this.beams) b.hide();
       this.player.die();
       setTimeout(() => {
@@ -903,6 +995,7 @@ export class Game {
     this.sfx.jet(0);
     this.sfx.laser(false);
     this.sfx.tesla(false);
+    this.sfx.flameLoop(false);
     for (const b of this.beams) b.hide();
     document.exitPointerLock();
     this.player.die();
@@ -914,7 +1007,7 @@ export class Game {
     }, 1100);
     setTimeout(() => {
       const title = this.deathCause === "fall" ? "Едрить ты камикадзе" : "Робот уничтожен";
-      this.hud.showOverlay(title, `${this.nick ? `${escapeHtml(this.nick)} · ` : ""}Счёт: ${this.score} · Волна: ${this.wave}<br>Кликни, чтобы сыграть ещё`, true);
+      this.overlay(title, `${this.nick ? `${escapeHtml(this.nick)} · ` : ""}Счёт: ${this.score} · Волна: ${this.wave}`, true);
     }, 2400);
   }
 
@@ -928,10 +1021,11 @@ export class Game {
       this.sfx.jet(0);
       this.sfx.laser(false);
       this.sfx.tesla(false);
+      this.sfx.flameLoop(false);
       for (const b of this.beams) b.hide();
       this.sfx.victory();
       document.exitPointerLock();
-      this.hud.showOverlay(this.nick ? `Победа, ${this.nick}!` : "Победа!", `Флагман сбит, Луна свободна.<br>Счёт: ${this.score}<br>Кликни, чтобы сыграть ещё`, true);
+      this.overlay(this.nick ? `Победа, ${this.nick}!` : "Победа!", `Флагман сбит, Луна свободна.<br>Счёт: ${this.score}`, true);
     }, 3500);
   }
 

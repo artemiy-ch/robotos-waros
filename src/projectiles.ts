@@ -1,5 +1,6 @@
 import { InstancedMesh, Mesh, MeshBuilder, ParticleSystem, Scene, Vector3 } from "@babylonjs/core";
 import type { Game } from "./game";
+import { HEADSHOT } from "../shared/mp";
 import { mat, segSphere } from "./util";
 
 /** "tracer" is the player's cannon round; "bolt" and "plasma" are hostile. */
@@ -12,6 +13,8 @@ interface Bullet {
   life: number;
   kind: ShotKind;
   dmg: number;
+  /** A player's turret fired it (multiplayer): it spares them, and its kills are theirs. */
+  by?: number;
 }
 
 interface Rocket {
@@ -76,13 +79,14 @@ export class Projectiles {
     return m;
   }
 
-  spawn(from: Vector3, vel: Vector3, kind: ShotKind, dmg: number) {
+  /** A round; `life` in seconds sets how far it goes (shotgun pellets don't go far). */
+  spawn(from: Vector3, vel: Vector3, kind: ShotKind, dmg: number, life = 2, by?: number) {
     const mesh = this.bases[kind].createInstance("b");
     mesh.isPickable = false;
     mesh.scaling.set(1, 1, kind === "tracer" ? 14 : kind === "bolt" ? 4 : 1.4);
     mesh.position.copyFrom(from);
     mesh.lookAt(from.add(vel));
-    this.bullets.push({ mesh, pos: from.clone(), vel, life: 2, kind, dmg });
+    this.bullets.push({ mesh, pos: from.clone(), vel, life, kind, dmg, by });
   }
 
   rocket(from: Vector3, dir: Vector3, g: Game, show = false) {
@@ -120,16 +124,17 @@ export class Projectiles {
 
       // Hostile fire with damage in it (copies of the host's bots fire blanks): us, or in a room another player.
       if (!dead && b.kind !== "tracer" && b.dmg > 0) {
-        if (g.player.alive && g.player.hitSpheres().some(([c, r]) => segSphere(prev, b.pos, c, r))) {
+        const ours = b.by !== undefined && b.by === g.arena?.me;
+        if (!ours && g.player.alive && g.player.hitSpheres().some(([c, r]) => segSphere(prev, b.pos, c, r))) {
           if (b.kind === "plasma") g.fx.pop(b.pos);
-          g.arena?.hitByBot();
+          g.arena?.hitByBot(b.by);
           g.hurtPlayer(b.dmg);
           dead = true;
         } else if (g.arena) {
-          const hit = g.arena.hitRemote(prev, b.pos);
+          const hit = g.arena.hitRemote(prev, b.pos, b.by);
           if (hit !== null) {
             if (b.kind === "plasma") g.fx.pop(b.pos);
-            g.arena.botHurt(hit, b.dmg);
+            g.arena.botHurt(hit, b.dmg, b.by);
             dead = true;
           }
         }
@@ -138,7 +143,8 @@ export class Projectiles {
         const e = g.enemies.hitTest(prev, b.pos);
         if (e) {
           g.fx.impact(b.pos, null);
-          g.enemies.damage(e, b.dmg, g);
+          const head = g.enemies.headshot(e, prev, b.pos);
+          g.enemies.damage(e, b.dmg * (head ? HEADSHOT : 1), g, false, head);
           dead = true;
         }
       }
